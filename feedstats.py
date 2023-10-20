@@ -22,6 +22,17 @@ import urllib3
 # Setting up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
 
+FEED_SUFFIXES = [
+    "feed/", "feed.xml", "index.xml", "default", "rss.xml", "atom.xml", "rss/", "feed",
+    "rss", "all.atom.xml", "feed.rss", "?format=rss", "feed.atom", "?feed=rss2",
+    "blog?format=rss", "?type=rss", "feed/?type=rss", "blog-feed.xml", "index.rss",
+    "atom", "atom/", "index.atom", "posts.atom", "blog.atom", "all.xml", "blog.xml",
+    "blog.rss", "all.rss.xml", "posts.xml", "posts.rss", "articles.xml", "rss.php",
+    "articles.atom", "blog/?feed=rss2", "blog", "all.rss", "wordpress/?feed=rss2",
+    "feed.php", "all"
+]
+
+
 TZINFOS = {
     "UT": pytz.UTC,                             # Coordinated Universal Time
     "EEST": pytz.timezone("Europe/Athens"),     # Eastern European Summer Time
@@ -141,91 +152,65 @@ def get_http_response(url, session, switch_to_http=False, force_https=False):
         logging.error(f"An unexpected error occurred. Error: {e}. URL: {url}")
         return None, str(e)
 
+def discover_feed(base_url, session, switch_to_http=False, force_https=False):
+    for suffix in FEED_SUFFIXES:
+        try_url = urljoin(base_url, suffix)
+        response, error = get_http_response(try_url, session, switch_to_http, force_https)
+
+        if response and response.content:
+            temp_soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
+            if temp_soup.find(['rss', 'feed', 'rdf']):
+                return temp_soup, try_url, ""
+            else:
+                logging.warning(f"No feed discovered at {try_url}")
+
+        else:
+            logging.warning(f"Failed to fetch content from {try_url}. Error: {error}")
+
+    error_message = f"No Atom or RSS feed found at URL (auto-detection attempted!) {base_url}"
+    return None, "", error_message
+
 def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force_https=False, auto_discover_feed=True, follow_feed_redirects=False):
 
-    
-    # Helper function to try auto-discovering feeds from a base_url
-    def discover_feed(base_url):
-        feed_suffixes = [
-            "feed/", "feed.xml", "index.xml", "default", "rss.xml", "atom.xml", "rss/", "feed",
-            "rss", "all.atom.xml", "feed.rss", "?format=rss", "feed.atom", "?feed=rss2",
-            "blog?format=rss", "?type=rss", "feed/?type=rss", "blog-feed.xml", "index.rss",
-            "atom", "atom/", "index.atom", "posts.atom", "blog.atom", "all.xml", "blog.xml",
-            "blog.rss", "all.rss.xml", "posts.xml", "posts.rss", "articles.xml", "rss.php",
-            "articles.atom", "blog/?feed=rss2", "blog", "all.rss", "wordpress/?feed=rss2",
-            "feed.php", "all"
-        ]
+    def fetch_content(url):
+        return get_http_response(url, session, switch_to_http, force_https)
 
-        for suffix in feed_suffixes:
-            try_url = urljoin(base_url, suffix)
-            logging.info(f"Attempting to discover feed at {try_url} (original url {original_url})")
-            response, error = get_http_response(try_url, session, switch_to_http, force_https)
+    feed_url_element = None
 
-            if response and response.content:
-                temp_soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
-                if temp_soup.find(['rss', 'feed', 'rdf']):
-                    logging.info(f"Discovered feed at {try_url}")
-                    return temp_soup, try_url, ""
-                else:
-                    logging.warning(f"No feed discovered at {try_url} (original url: {original_url})")
-            else:
-                logging.warning(f"Failed to fetch content from {try_url} (original url: {original_url}). Error: {error}")
+    if soup is None and not auto_discover_feed:
+        return None, url, "Soup is None and auto-discover_feed is disabled"
 
-        return None, "", f"No Atom or RSS feed found at URL (auto-detection attempted!) {base_url} (original url: {original_url})"
+    if soup:
+        feed_url_element = soup.find('link', type='application/atom+xml') or soup.find('link', type='application/rss+xml')
 
+    if not feed_url_element and auto_discover_feed:
+        soup, url, error_message = discover_feed(original_url, session)
+        if soup is None:
+            return None, url, error_message
 
-    # Attempt to find feed_url from the provided soup
-    feed_url_element = soup.find('link', type='application/atom+xml') or soup.find('link', type='application/rss+xml')
-
-    # If feed_url is not found in the soup:
-    if not feed_url_element:
-        logging.error(f"No Atom or RSS feed found at URL {url} (original url: {original_url})")
-
-        # If auto-discover is enabled, try discovering the feed.
-        if auto_discover_feed:
-            soup, url, error_message = discover_feed(original_url)
-            if soup is None:
-                logging.error(error_message)
-                return None, url, error_message
-
-        # If no feed was found and we can't auto-discover, return an error.
-        else:
-            return None, url, f"No Atom or RSS feed found at URL {url} (original url: {original_url})"
-
-    else:
-        # If feed_url is found, compute the absolute URL
+    if feed_url_element:
         url = urljoin(url, feed_url_element.get('href'))
-        logging.info(f"Discovered valid feed at: {url} (original url: {original_url})")
-
-        # Insert the new code segment for following redirects here:
         if follow_feed_redirects:
-            feed_response, error = get_http_response(url, session, switch_to_http, force_https)
+            feed_response, error = fetch_content(url)
             if feed_response and feed_response.url != url:
-                logging.info(f"Feed URL Redirected: {url} -> {feed_response.url}")  # Logging redirection
+                logging.info(f"Feed URL Redirected: {url} -> {feed_response.url}")
                 url = feed_response.url
             elif error:
                 logging.warning(f"Error following feed URL redirect (url: {url}): {error}")
 
-    # Fetch the content of the computed URL
-    response, error = get_http_response(url, session, switch_to_http, force_https)
-
-    if error:
-        logging.error(f'Error fetching feed URL {url}: {error}')
-        return None, url, error  # Directly returning an error message instead of raising an exception
+    response, error = fetch_content(url)
 
     try:
         soup = BeautifulSoup(response.content, 'xml')
         if not soup:
             error_message = f"Failed to parse content into soup for URL {url}."
             logging.error(error_message)
-            return None, url, error_message  # Include the URL in the return as well
-
+            return None, url, error_message
         return soup, url, ""
-    except Exception as e:
+    except ValueError as e:  # More specific exception, you can add more as needed
         error_message = f"Error parsing XML from URL {url}: {e}"
         logging.error(error_message)
-        return None, url, error_message  # Include the URL in the return as well
-
+        return None, url, error_message
 
 def filter_dates(dates, url):
     if len(dates) < 2:
@@ -425,8 +410,8 @@ def detect_blogging_platform(soup):
     if not generator_tag:
         return ""  # return empty string if platform can't be determined
     
-    tag_text = generator_tag.text.strip()
-    
+    tag_text = generator_tag.text.strip().replace('\n', ' ')  # Replacing newlines with spaces
+
     # List of patterns for known platforms and their corresponding names
     known_platform_patterns = [
         (re.compile(r'substack', re.I), "Substack"),
@@ -442,9 +427,8 @@ def detect_blogging_platform(soup):
 
     # If text doesn't match any known pattern
     # Return the text if it exists, else return the entire tag
-    #return tag_text if tag_text else str(generator_tag)
-    return str(generator_tag)
-
+    #return tag_text if tag_text else str(generator_tag).replace('\n', ' ')
+    return str(generator_tag).replace('\n', ' ')
 
 
 def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter_dates_enabled=False, log_external=False, switch_to_http=False, force_https=False, auto_discover_feed=False, follow_feed_redirects=False):
@@ -469,13 +453,19 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
 
     session = get_http_session()
 
+    # If auto_discover_feed is enabled, attempt direct feed discovery first
+    if auto_discover_feed:
+        soup, url, error_message_from_feed = fetch_feed_url(soup=None, url=original_url, session=session, original_url=original_url, switch_to_http=switch_to_http, force_https=force_https, auto_discover_feed=auto_discover_feed, follow_feed_redirects=follow_feed_redirects)
+        if soup is None:  # If feed discovery failed, return the error
+            status_or_error = error_message_from_feed
+            return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
+
     try:
         response, error = get_http_response(url, session, switch_to_http, force_https)
 
         if response is None:
             status_or_error = error
             return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
-
 
         if response.url != url:
             logging.info(f"URL Redirected: {url} -> {response.url}")
@@ -486,15 +476,7 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
 
         blogging_platform = detect_blogging_platform(soup)
 
-        if soup and not soup.find(['rss', 'feed', 'rdf']):
-            soup, url, error_message_from_feed = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
-            if soup is None:
-                status_or_error = error_message_from_feed
-                return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
-
-
-
-
+        # Fetching post dates and other statistics from the soup
         dates, num_posts_str = get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_enabled)
 
         oldest_post = dates[0].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
@@ -521,7 +503,6 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
         status_or_error = combine_status_and_error(status_code_str, error_message)
 
         return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
-
 
     except ProcessUrlError as e:
         error_message = str(e)
