@@ -183,6 +183,11 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
     if soup:
         feed_url_element = soup.find('link', type='application/atom+xml') or soup.find('link', type='application/rss+xml')
 
+    # If there's no feed_url_element found and auto_discover_feed is False, then return with an error
+    if not feed_url_element and not auto_discover_feed:
+        error_message = f"No direct or indirect Atom, RSS, or RDF feed found (URL: {url})"
+        return None, url, error_message
+
     if not feed_url_element and auto_discover_feed:
         soup, url, error_message = discover_feed(original_url, session)
         if soup is None:
@@ -206,7 +211,15 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
             error_message = f"Failed to parse content into soup for URL {url}."
             logging.error(error_message)
             return None, url, error_message
+        
+        # Added step to check for valid feed elements
+        if not soup.find(['rss', 'feed', 'rdf']):
+            error_message = "Content fetched but no valid Atom, RSS, or RDF feed found."
+            logging.error(error_message)
+            return None, url, error_message
+
         return soup, url, ""
+
     except ValueError as e:  # More specific exception, you can add more as needed
         error_message = f"Error parsing XML from URL {url}: {e}"
         logging.error(error_message)
@@ -453,65 +466,56 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
 
     session = get_http_session()
 
-    # If auto_discover_feed is enabled, attempt direct feed discovery first
-    if auto_discover_feed:
-        soup, url, error_message_from_feed = fetch_feed_url(soup=None, url=original_url, session=session, original_url=original_url, switch_to_http=switch_to_http, force_https=force_https, auto_discover_feed=auto_discover_feed, follow_feed_redirects=follow_feed_redirects)
-        if soup is None:  # If feed discovery failed, return the error
-            status_or_error = error_message_from_feed
-            return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
+    soup = None
+    error_message_from_feed = None
 
-    try:
-        response, error = get_http_response(url, session, switch_to_http, force_https)
+    # First, try to fetch the URL directly
+    response, error = get_http_response(url, session, switch_to_http, force_https)
 
-        if response is None:
-            status_or_error = error
-            return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
-
+    if response:
+        content = response.content.decode('utf-8', 'ignore')
+        soup = BeautifulSoup(content, determine_parser(content))
+        blogging_platform = detect_blogging_platform(soup)
         if response.url != url:
             logging.info(f"URL Redirected: {url} -> {response.url}")
             url = response.url
 
-        content = response.content.decode('utf-8', 'ignore')
-        soup = BeautifulSoup(content, determine_parser(content))
+    # If direct fetching failed or there's no content and auto_discover_feed is enabled, then attempt auto-discovery
+    if not soup and auto_discover_feed:
+        soup, url, error_message_from_feed = fetch_feed_url(soup=None, url=original_url, session=session, original_url=original_url, switch_to_http=switch_to_http, force_https=force_https, auto_discover_feed=auto_discover_feed, follow_feed_redirects=follow_feed_redirects)
 
-        blogging_platform = detect_blogging_platform(soup)
-
-        # Fetching post dates and other statistics from the soup
-        dates, num_posts_str = get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_enabled)
-
-        oldest_post = dates[0].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
-        newest_post = dates[-1].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
-        status_code_str = str(response.status_code)
-
-        date_diff = dates[-1] - dates[0] if dates else timedelta(days=0)
-        try:
-            if date_diff.days == 0:
-                avg_posts_per_day = len(dates)
-                avg_posts_per_week = len(dates) * 7
-            else:
-                avg_posts_per_day = len(dates) / date_diff.days
-                avg_posts_per_week = avg_posts_per_day * 7
-            avg_posts_per_day_str = f'{avg_posts_per_day:.8f}'
-            avg_posts_per_week_str = f'{avg_posts_per_week:.8f}'
-        except ZeroDivisionError as e:
-            error_message = f"Error calculating averages: {str(e)}"
-            logging.error(error_message)
-        except Exception as e:
-            error_message = f"Unexpected error: {str(e)}"
-            logging.error(error_message)
-
-        status_or_error = combine_status_and_error(status_code_str, error_message)
-
+    # If both methods failed, return an error
+    if not soup:
+        status_or_error = error_message_from_feed or error
         return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
 
-    except ProcessUrlError as e:
-        error_message = str(e)
-        status_or_error = combine_status_and_error(status_code_str, error_message)
-        return f'{avg_posts_per_day_str}\t{avg_posts_per_week_str}\t{original_url}\t{newest_post}\t{oldest_post}\t{num_posts_str}\t{status_or_error}\t{url}\t{bid_url}'
+    # Fetching post dates and other statistics from the soup
+    dates, num_posts_str = get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_enabled)
+
+    oldest_post = dates[0].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
+    newest_post = dates[-1].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
+    status_code_str = str(response.status_code) if response else ""
+
+    date_diff = dates[-1] - dates[0] if dates else timedelta(days=0)
+    try:
+        if date_diff.days == 0:
+            avg_posts_per_day = len(dates)
+            avg_posts_per_week = len(dates) * 7
+        else:
+            avg_posts_per_day = len(dates) / date_diff.days
+            avg_posts_per_week = avg_posts_per_day * 7
+        avg_posts_per_day_str = f'{avg_posts_per_day:.8f}'
+        avg_posts_per_week_str = f'{avg_posts_per_week:.8f}'
+    except ZeroDivisionError as e:
+        error_message = f"Error calculating averages: {str(e)}"
+        logging.error(error_message)
     except Exception as e:
-        error_message = str(e)
-        status_or_error = combine_status_and_error(status_code_str, error_message)
-        return f'{avg_posts_per_day_str}\t{avg_posts_per_week_str}\t{original_url}\t{newest_post}\t{oldest_post}\t{num_posts_str}\t{status_or_error}\t{url}\t{bid_url}'
+        error_message = f"Unexpected error: {str(e)}"
+        logging.error(error_message)
+
+    status_or_error = combine_status_and_error(status_code_str, error_message)
+
+    return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
 
 def extract_urls_from_outline(outline_element, handle_blogtrottr):
     urls_and_bids = []
