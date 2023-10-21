@@ -587,7 +587,6 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
 
         # Check for valid feed tags and attempt discovery if none are found
         if not soup.find(lambda tag: tag.name and tag.name.lower() in ['rss', 'feed', 'rdf']):
-            print(soup)
             logging.info(f"Initial attempt to find feed at {url} failed. Trying further discovery.")
             soup, url, error_message_from_fetch = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
             
