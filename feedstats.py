@@ -74,6 +74,13 @@ RETRY_STRATEGY = Retry(
     respect_retry_after_header=True
 )
 
+def is_retryable_exception(exception):
+    """Check if the exception is retryable."""
+    retryable_exceptions = (
+        urllib3.exceptions.ProtocolError      # For lower-level protocol errors (from urllib3)
+    )
+    return isinstance(exception, retryable_exceptions)
+
 
 # EXCEPTIONS
 class HTTPError(Exception):
@@ -121,7 +128,7 @@ def discover_feed(base_url, session, switch_to_http=False, force_https=False):
 
         if response and response.content:
             temp_soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
-            if temp_soup.find(['rss', 'feed', 'rdf']):
+            if temp_soup.find(lambda tag: tag.name and tag.name.lower() in ['rss', 'feed', 'rdf']):
                 logging.info(f"Valid feed discovered at {try_url}")
                 return temp_soup, try_url, ""
             else:
@@ -178,7 +185,7 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
             return None, url, error_message
 
         # Check for valid feed elements
-        if not soup.find(['rss', 'feed', 'rdf']):
+        if not soup.find(lambda tag: tag.name and tag.name.lower() in ['rss', 'feed', 'rdf']):
             error_message = f"{response.status_code} Not a valid Atom, RSS, or RDF feed XML: {response.url}"
             logging.error(error_message)
             
@@ -289,17 +296,22 @@ def custom_date_parser(date_str, heuristic_date_parsing, url):
         logging.error(f"Invalid date encountered for URL: {url}. Date string: {date_str}")
         return None
 
+def valid_name(name):
+    if not name:
+        return False
+    if isinstance(name, str):
+        return 'item' in name.lower()
+    return False
+
 def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
     """Extract dates from the soup object and count the number of posts."""
 
     dates = []
-    posts = []
 
     # RSS Feed Handling
     if soup.find('rss'):
         posts = soup.find_all('item')
         for post in posts:
-            # Use a lambda function for case-insensitive search for pubDate element
             pub_date_element = post.find(lambda tag: tag.name and tag.name.lower() == 'pubdate')
             if pub_date_element and pub_date_element.text:
                 try:
@@ -315,43 +327,47 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
     # Atom Handling
     elif soup.find('feed'):
         posts = soup.find_all(['entry', 'item'])
-        atom_dates = []
-        for post in posts:
-            date_text = post.find('published').text if post.find('published') else None
-            if date_text:
-                try:
-                    parsed_date = custom_date_parser(date_text, heuristic_date_parsing, url)
-                    if parsed_date:
-                        atom_dates.append(parsed_date)
-                    else:
-                        logging.error(f"Unable to parse Atom post date for URL {url}: {date_text}")
-                except ValueError as e:
-                    logging.error(f"Invalid date in Atom post for URL {url}: {date_text} - Error: {e}")
-        if atom_dates:
-            dates.extend(atom_dates)
-        else:
+        atom_dates = [post.find('published').text for post in posts if post.find('published') and post.find('published').text]
+
+        for date_text in atom_dates:
+            try:
+                parsed_date = custom_date_parser(date_text, heuristic_date_parsing, url)
+                if parsed_date:
+                    dates.append(parsed_date)
+                else:
+                    logging.error(f"Unable to parse Atom post date for URL {url}: {date_text}")
+
+            except ValueError as e:
+                logging.error(f"Invalid date in Atom post for URL {url}: {date_text} - Error: {e}")
+
+        if not atom_dates:
             updated_dates = [parse(post.updated.text, tzinfos=TZINFOS) for post in posts if post.updated and post.updated.text and not any([post.find('pubDate'), post.find('published')])]
             if updated_dates:
                 dates.extend(updated_dates)
-
+    
     # RDF Handling
-    elif soup.find('rdf:RDF', namespaces={'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'}):
-        posts = soup.find_all(['item', 'rdf:Description'], namespaces={'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'})
+    elif soup.find(lambda tag: tag.name and tag.name.lower() in ['rdf', 'rdf:rdf']):
+        # Directly fetch all item tags
+        posts = soup.find_all('item')
+        logging.info(f"Found {len(posts)} RDF items for URL {url}")
 
         for post in posts:
-            date_element = post.find('dc:date', namespaces={'dc': 'http://purl.org/dc/elements/1.1/'})
-            date_text = date_element.text if date_element else None
-            if date_text:
+            # Use a lambda function to search for the 'dc:date' tag
+            date_element = post.find('dc:date')
+            if date_element:
+                date_text = date_element.text
                 try:
                     parsed_date = custom_date_parser(date_text, heuristic_date_parsing, url)
                     if parsed_date:
                         dates.append(parsed_date)
                     else:
                         logging.error(f"Unable to parse RDF post date for URL {url}: {date_text}")
-
                 except ValueError as e:
                     logging.error(f"Invalid date in RDF post for URL {url}: {date_text} - Error: {e}")
+            else:
+                logging.debug(f"No date found for an RDF post in URL {url}")
 
+    # Ensure all dates have a timezone
     dates = [date.replace(tzinfo=pytz.UTC) if date.tzinfo is None else date for date in dates]
 
     return dates, len(posts)
@@ -371,16 +387,20 @@ def determine_parser(content):
 
     # Check for common HTML indicators
     is_html = '<!doctype html>' in content_lower or '<html' in content_lower
+    
+    # Check for RDF tag, which indicates it might be an XML-based RSS feed
+    is_rdf = '<rdf:rdf' in content_lower
 
     # Determine parser type
-    if is_xml and not is_html:
+    if (is_xml or is_rdf) and not is_html:
         return 'xml'
     elif not is_xml and is_html:
         return 'html.parser'
-    elif is_xml and is_html:
+    elif (is_xml or is_rdf) and is_html:
         return 'xml'
     else:
         return 'html.parser'
+
 
 def format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr):
     base_output = f'{avg_posts_per_day_str}\t{avg_posts_per_week_str}\t{original_url}\t{newest_post}\t{oldest_post}\t{num_posts_str}\t{status_or_error}\t{url}\t{blogging_platform}'
@@ -470,6 +490,10 @@ def get_http_response(url, session, switch_to_http=False, force_https=False):
         try:
             r = session.get(u, timeout=TIMEOUT, headers=HEADERS, verify=True)
             r.raise_for_status()
+
+            # Check and log redirection after a successful request
+            handle_redirection(r, u)
+            
             return r, ""
         except requests.RequestException as e:
             if e.response and e.response.status_code:
@@ -484,6 +508,10 @@ def get_http_response(url, session, switch_to_http=False, force_https=False):
     # Main fetching
     response, error = try_fetch(url)
 
+    # Log the original error that causes trying alternate schemes
+    if error:
+        logging.error(f"Failed request with original URL: {url}. Error: {error}")
+    
     # Check if we should handle alternate schemes due to error
     if error:
         alt_url = None
@@ -512,7 +540,6 @@ def handle_redirection(response, url):
         logging.info(f"URL Redirected: {url} -> {response.url}")
         return response.url
     return url
-
 
 def fetch_content(url, session, switch_to_http=False, force_https=False):
     # Fetch content from the URL and handle redirections.
@@ -559,7 +586,8 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
         soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
 
         # Check for valid feed tags and attempt discovery if none are found
-        if not soup.find(['rss', 'feed', 'rdf']):
+        if not soup.find(lambda tag: tag.name and tag.name.lower() in ['rss', 'feed', 'rdf']):
+            print(soup)
             logging.info(f"Initial attempt to find feed at {url} failed. Trying further discovery.")
             soup, url, error_message_from_fetch = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
             
