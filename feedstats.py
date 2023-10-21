@@ -109,7 +109,7 @@ def get_http_response(url, session, switch_to_http=False, force_https=False):
         if response.history:
             url = response.url
 
-        return response, ""
+        return response, str(response.status_code)
 
     except requests.RequestException as req_err:
         alt_scheme_url = url  # Default to the original URL
@@ -129,7 +129,8 @@ def get_http_response(url, session, switch_to_http=False, force_https=False):
 
         logging.warning(log_message)
 
-        if alt_scheme_url != url:  # Only proceed if we actually changed the scheme
+        # If we changed the scheme, try fetching the content again with the new scheme
+        if alt_scheme_url != url:
             try:
                 response = session.get(alt_scheme_url, timeout=TIMEOUT, headers=HEADERS, verify=True)
                 response.raise_for_status()
@@ -138,15 +139,17 @@ def get_http_response(url, session, switch_to_http=False, force_https=False):
                     alt_scheme_url = response.url
 
                 logging.info(f"Request successful. Original URL: {url}. Accessed URL: {alt_scheme_url}")
-                return response, ""
+                return response, str(response.status_code)
 
             except requests.RequestException as e2:
                 logging.error(f"Error fetching URL {alt_scheme_url}. Reverting to original URL {url}. Error: {e2}")
-                return None, str(e2)
+                status_or_error = combine_status_and_error(str(e2.response.status_code) if e2.response else "", str(e2))
+                return None, status_or_error
 
         else:
             logging.error(f"Failed request. Error: {req_err}. URL: {url}")
-            return None, str(req_err)  # Return the original error message
+            status_or_error = combine_status_and_error(str(req_err.response.status_code) if req_err.response else "", str(req_err))
+            return None, status_or_error
 
     except Exception as e:
         # Catch any other exceptions
@@ -212,7 +215,7 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
     response, error = fetch_content(url)
 
     try:
-        soup = BeautifulSoup(response.content, 'xml')
+        soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
         if not soup:
             error_message = f"Failed to parse content into soup for URL {url}."
             logging.error(error_message)
@@ -446,64 +449,13 @@ def detect_blogging_platform(soup):
     #return tag_text if tag_text else str(generator_tag).replace('\n', ' ')
     return str(generator_tag).replace('\n', ' ')
 
-def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter_dates_enabled=False, log_external=False, switch_to_http=False, force_https=False, auto_discover_feed=False, follow_feed_redirects=False):
-
-    if not log_external:
-        logging.getLogger("urllib3").setLevel(logging.ERROR)
-
-    original_url = url
-    if handle_blogtrottr:
-        url = sanitize_url(url)
-    bid_url = f"https://blogtrottr.com/subscription/{bid}" if bid else ""
-
-    blogging_platform = ''
-    avg_posts_per_day_str = ''
-    avg_posts_per_week_str = ''
-    newest_post = ''
-    oldest_post = ''
-    num_posts_str = ''
-    status_code_str = ''
-    error_message = ''
-
-    session = get_http_session()
-
-    soup = None
-    error_message_from_feed = None
-
-    # First, try to fetch the URL directly
-    response, error = get_http_response(url, session, switch_to_http, force_https)
-
-    if response:
-        content = response.content.decode('utf-8', 'ignore')
-        soup = BeautifulSoup(content, determine_parser(content))
-        blogging_platform = detect_blogging_platform(soup)
-        if response.url != url:
-            logging.info(f"URL Redirected: {url} -> {response.url}")
-            url = response.url
-
-    # If direct fetching failed or there's no content and auto_discover_feed is enabled, then attempt auto-discovery
-    if not soup and auto_discover_feed:
-        soup, url, error_message_from_feed = fetch_feed_url(soup=None, url=original_url, session=session, original_url=original_url, switch_to_http=switch_to_http, force_https=force_https, auto_discover_feed=auto_discover_feed, follow_feed_redirects=follow_feed_redirects)
-
-    # If both methods failed, return an error
-    if not soup:
-        status_or_error = error_message_from_feed or error
-        return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
-
-    soup, url, error_message_from_feed = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
-    if soup is None:
-        status_or_error = error_message_from_feed
-        return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
-
-
-    # Fetching post dates and other statistics from the soup
+def extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled):
     dates, num_posts_str = get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_enabled)
-
     oldest_post = dates[0].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
     newest_post = dates[-1].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
-    status_code_str = str(response.status_code) if response else ""
 
     date_diff = dates[-1] - dates[0] if dates else timedelta(days=0)
+    avg_posts_per_day_str, avg_posts_per_week_str = "", ""
     try:
         if date_diff.days == 0:
             avg_posts_per_day = len(dates)
@@ -514,15 +466,72 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
         avg_posts_per_day_str = f'{avg_posts_per_day:.8f}'
         avg_posts_per_week_str = f'{avg_posts_per_week:.8f}'
     except ZeroDivisionError as e:
-        error_message = f"Error calculating averages: {str(e)}"
-        logging.error(error_message)
+        logging.error(f"Error calculating averages: {str(e)}")
     except Exception as e:
-        error_message = f"Unexpected error: {str(e)}"
-        logging.error(error_message)
+        logging.error(f"Unexpected error: {str(e)}")
 
-    status_or_error = combine_status_and_error(status_code_str, error_message)
+    return avg_posts_per_day_str, avg_posts_per_week_str, newest_post, oldest_post, num_posts_str
 
-    return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
+
+def handle_discovery(url, session, switch_to_http=False, force_https=False, auto_discover_feed=False):
+    if not auto_discover_feed:
+        return None, url, "Auto-discovery is disabled."
+
+    soup, url, error_message_from_feed = discover_feed(url, session, switch_to_http, force_https)
+    if soup is None:
+        return None, url, error_message_from_feed
+
+    return soup, url, ""
+
+def fetch_content(url, session, switch_to_http=False, force_https=False):
+    # Fetch content from the URL and handle redirections.
+    response, error = get_http_response(url, session, switch_to_http, force_https)
+    
+    if response:
+        if response.url != url:
+            logging.info(f"URL Redirected: {url} -> {response.url}")
+            url = response.url
+        return response, f"HTTP {response.status_code}"
+    else:
+        # If there's no response, return the error as the status_or_error
+        return None, error
+
+
+def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter_dates_enabled=False, log_external=False, 
+                switch_to_http=False, force_https=False, auto_discover_feed=False, follow_feed_redirects=False):
+
+    original_url = url
+    if handle_blogtrottr:
+        url = sanitize_url(url)
+    bid_url = f"https://blogtrottr.com/subscription/{bid}" if bid else ""
+    session = get_http_session()
+
+    response, error_or_status = fetch_content(url, session, switch_to_http, force_https)
+    
+    # Set a default value for soup
+    soup = None
+
+    # If direct fetching is successful, parse the content
+    if response and response.content:
+        soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
+
+    # Check for valid feed tags
+    if soup is None or not soup.find(['rss', 'feed', 'rdf']):
+        if response:
+            # The fetch was successful, but no valid feed was found
+            error_message = "No valid Atom, RSS, or RDF feed found."
+            status_or_error = combine_status_and_error(f"HTTP {response.status_code}", error_message)
+        else:
+            # There was an HTTP error while fetching or couldn't fetch at all
+            status_or_error = combine_status_and_error(error_or_status, "Failed to fetch content.")
+        
+        # Return early with the error message
+        return format_output("", "", original_url, "", "", "", status_or_error, url, "", bid_url, handle_blogtrottr)
+
+    blogging_platform = detect_blogging_platform(soup)
+    avg_posts_per_day_str, avg_posts_per_week_str, newest_post, oldest_post, num_posts_str = extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled)
+    
+    return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, "HTTP " + str(response.status_code), url, blogging_platform, bid_url, handle_blogtrottr)
 
 def extract_urls_from_outline(outline_element, handle_blogtrottr):
     urls_and_bids = []
