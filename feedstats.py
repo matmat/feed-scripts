@@ -5,7 +5,7 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import timedelta, datetime
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import pytz
 import requests
@@ -92,69 +92,7 @@ def sanitize_url(url):
         return unquote(url.replace(BASE_URL, ''))
     return url
 
-def get_http_response(url, session, switch_to_http=False, force_https=False):
-    """Fetch the HTTP response using requests with a retry strategy."""
 
-    original_scheme = urlparse(url).scheme
-
-    # Check if we should unconditionally switch to HTTPS
-    if force_https and original_scheme == 'http':  
-        url = url.replace('http://', 'https://')
-
-    try:
-        response = session.get(url, timeout=TIMEOUT, headers=HEADERS, verify=True)
-        response.raise_for_status()
-
-        # If there were redirects, update the URL to the final URL after redirection
-        if response.history:
-            url = response.url
-
-        return response, str(response.status_code)
-
-    except requests.RequestException as req_err:
-        alt_scheme_url = url  # Default to the original URL
-
-        # Check if we should switch to HTTP on HTTPS error
-        if switch_to_http and original_scheme == 'https': 
-            alt_scheme_url = url.replace('https://', 'http://')
-            log_message = f"Encountered error with HTTPS. Error: {req_err}. Original URL: {url}. Trying URL: {alt_scheme_url}"
-
-        # Check if we should revert to HTTPS on HTTP error
-        elif force_https and original_scheme == 'http':
-            alt_scheme_url = url.replace('http://', 'https://')
-            log_message = f"Encountered error with HTTP. Error: {req_err}. Original URL: {url}. Trying URL: {alt_scheme_url}"
-
-        else:
-            log_message = f"Encountered error with {original_scheme.upper()}. Error: {req_err}. URL: {url}"
-
-        logging.warning(log_message)
-
-        # If we changed the scheme, try fetching the content again with the new scheme
-        if alt_scheme_url != url:
-            try:
-                response = session.get(alt_scheme_url, timeout=TIMEOUT, headers=HEADERS, verify=True)
-                response.raise_for_status()
-
-                if response.history:
-                    alt_scheme_url = response.url
-
-                logging.info(f"Request successful. Original URL: {url}. Accessed URL: {alt_scheme_url}")
-                return response, str(response.status_code)
-
-            except requests.RequestException as e2:
-                logging.error(f"Error fetching URL {alt_scheme_url}. Reverting to original URL {url}. Error: {e2}")
-                status_or_error = combine_status_and_error(str(e2.response.status_code) if e2.response else "", str(e2))
-                return None, status_or_error
-
-        else:
-            logging.error(f"Failed request. Error: {req_err}. URL: {url}")
-            status_or_error = combine_status_and_error(str(req_err.response.status_code) if req_err.response else "", str(req_err))
-            return None, status_or_error
-
-    except Exception as e:
-        # Catch any other exceptions
-        logging.error(f"An unexpected error occurred. Error: {e}. URL: {url}")
-        return None, str(e)
 
 def discover_feed(base_url, session, switch_to_http=False, force_https=False):
     for suffix in FEED_SUFFIXES:
@@ -472,7 +410,6 @@ def extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled):
 
     return avg_posts_per_day_str, avg_posts_per_week_str, newest_post, oldest_post, num_posts_str
 
-
 def handle_discovery(url, session, switch_to_http=False, force_https=False, auto_discover_feed=False):
     if not auto_discover_feed:
         return None, url, "Auto-discovery is disabled."
@@ -483,6 +420,74 @@ def handle_discovery(url, session, switch_to_http=False, force_https=False, auto
 
     return soup, url, ""
 
+def get_http_response(url, session, switch_to_http=False, force_https=False):
+    """Fetch the HTTP response using requests with a retry strategy."""
+
+    parsed_url = urlparse(url)
+    original_scheme = parsed_url.scheme
+
+    # Check if we should unconditionally switch to HTTPS
+    if force_https and original_scheme == 'http':
+        parsed_url = urlparse(url)
+        url = urlunparse(parsed_url._replace(scheme='https'))
+
+    try:
+        response = session.get(url, timeout=TIMEOUT, headers=HEADERS, verify=True)
+        response.raise_for_status()
+
+        # If there were redirects, update the URL to the final URL after redirection
+        if response.history:
+            url = response.url
+
+        return response, str(response.status_code)
+
+    except requests.RequestException as req_err:
+        alt_scheme_url = url  # Default to the original URL
+
+        # Check if we should switch to HTTP on HTTPS error
+        if switch_to_http and original_scheme == 'https':
+            parsed_url = urlparse(url)
+            alt_scheme_url = urlunparse(parsed_url._replace(scheme='http'))
+            log_message = f"Encountered error with HTTPS. Error: {req_err}. Original URL: {url}. Trying URL: {alt_scheme_url}"
+
+        # Check if we should revert to HTTPS on HTTP error
+        elif force_https and original_scheme == 'http':
+            parsed_url = urlparse(url)
+            alt_scheme_url = urlunparse(parsed_url._replace(scheme='https'))
+            log_message = f"Encountered error with HTTP. Error: {req_err}. Original URL: {url}. Trying URL: {alt_scheme_url}"
+
+        else:
+            log_message = f"Encountered error with {original_scheme.upper()}. Error: {req_err}. URL: {url}"
+
+        logging.warning(log_message)
+
+        # If we changed the scheme, try fetching the content again with the new scheme
+        if alt_scheme_url != url:
+            try:
+                response = session.get(alt_scheme_url, timeout=TIMEOUT, headers=HEADERS, verify=True)
+                response.raise_for_status()
+
+                if response.history:
+                    alt_scheme_url = response.url
+
+                logging.info(f"Request successful. Original URL: {url}. Accessed URL: {alt_scheme_url}")
+                return response, str(response.status_code)
+
+            except requests.RequestException as e2:
+                logging.error(f"Error fetching URL {alt_scheme_url}. Reverting to original URL {url}. Error: {e2}")
+                status_or_error = combine_status_and_error(str(e2.response.status_code) if e2.response else "", str(e2))
+                return None, status_or_error
+
+        else:
+            logging.error(f"Failed request. Error: {req_err}. URL: {url}")
+            status_or_error = combine_status_and_error(str(req_err.response.status_code) if req_err.response else "", str(req_err))
+            return None, status_or_error
+
+    except Exception as e:
+        # Catch any other exceptions
+        logging.error(f"An unexpected error occurred. Error: {e}. URL: {url}")
+        return None, str(e)
+
 def fetch_content(url, session, switch_to_http=False, force_https=False):
     # Fetch content from the URL and handle redirections.
     response, error = get_http_response(url, session, switch_to_http, force_https)
@@ -491,11 +496,10 @@ def fetch_content(url, session, switch_to_http=False, force_https=False):
         if response.url != url:
             logging.info(f"URL Redirected: {url} -> {response.url}")
             url = response.url
-        return response, f"HTTP {response.status_code}"
+        return response, f"{response.status_code}"
     else:
         # If there's no response, return the error as the status_or_error
         return None, error
-
 
 def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter_dates_enabled=False, log_external=False, 
                 switch_to_http=False, force_https=False, auto_discover_feed=False, follow_feed_redirects=False):
@@ -520,7 +524,7 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
         if response:
             # The fetch was successful, but no valid feed was found
             error_message = "No valid Atom, RSS, or RDF feed found."
-            status_or_error = combine_status_and_error(f"HTTP {response.status_code}", error_message)
+            status_or_error = combine_status_and_error(f"{response.status_code}", error_message)
         else:
             # There was an HTTP error while fetching or couldn't fetch at all
             status_or_error = combine_status_and_error(error_or_status, "Failed to fetch content.")
@@ -531,7 +535,7 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
     blogging_platform = detect_blogging_platform(soup)
     avg_posts_per_day_str, avg_posts_per_week_str, newest_post, oldest_post, num_posts_str = extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled)
     
-    return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, "HTTP " + str(response.status_code), url, blogging_platform, bid_url, handle_blogtrottr)
+    return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, str(response.status_code), url, blogging_platform, bid_url, handle_blogtrottr)
 
 def extract_urls_from_outline(outline_element, handle_blogtrottr):
     urls_and_bids = []
