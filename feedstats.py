@@ -1,4 +1,5 @@
 import argparse
+import dns.resolver
 import logging
 import multiprocessing
 import re
@@ -14,6 +15,7 @@ from dateutil.parser import parse
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import urllib3
+
 
 # Setting up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
@@ -49,16 +51,29 @@ TZINFOS = {
 }
 
 USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
-TIMEOUT = 10
+TIMEOUT = 30
 BASE_URL = 'http://sanitizer.blogtrottr.com/sanitize?url='
 HEADERS = {'User-Agent': USER_AGENT}
 MAX_PROCESSES = 300  # Set a maximum number of processes
+from requests.packages.urllib3.util.retry import Retry
+
 RETRY_STRATEGY = Retry(
+    # Total number of retries
     total=3,
-    status_forcelist=[429, 500, 502, 503, 504],
+    
+    # Status codes to trigger a retry
+    status_forcelist=[408, 413, 423, 429, 440, 449, 500, 502, 503, 504],
+    
+    # Methods to be retried
     allowed_methods=["HEAD", "GET", "OPTIONS"],
-    backoff_factor=1
+    
+    # Exponential backoff (wait time between retries doubles)
+    backoff_factor=1,  # You can adjust this, e.g., 0.5 for shorter waits, 2 for longer waits.
+    
+    # Respect Retry-After header (use header's value for delay if available)
+    respect_retry_after_header=True
 )
+
 
 # EXCEPTIONS
 class HTTPError(Exception):
@@ -95,21 +110,28 @@ def sanitize_url(url):
 
 
 def discover_feed(base_url, session, switch_to_http=False, force_https=False):
+    logging.info(f"Starting feed discovery for base URL: {base_url}")
+
     for suffix in FEED_SUFFIXES:
         try_url = urljoin(base_url, suffix)
+        
+        logging.info(f"Trying feed URL: {try_url}")
+        
         response, error = get_http_response(try_url, session, switch_to_http, force_https)
 
         if response and response.content:
             temp_soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
             if temp_soup.find(['rss', 'feed', 'rdf']):
+                logging.info(f"Valid feed discovered at {try_url}")
                 return temp_soup, try_url, ""
             else:
-                logging.warning(f"No feed discovered at {try_url}")
+                logging.warning(f"No valid feed structure discovered at {try_url}")
 
         else:
-            logging.warning(f"Failed to fetch content from {try_url}. Error: {error}")
+            logging.error(f"Failed to fetch content from {try_url}. Error: {error}")
 
     error_message = f"No Atom or RSS feed found at URL (auto-detection attempted!) {base_url}"
+    logging.error(error_message)
     return None, "", error_message
 
 def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force_https=False, auto_discover_feed=True, follow_feed_redirects=False):
@@ -119,11 +141,9 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
 
     feed_url_element = None
 
-
     if soup is None and not auto_discover_feed:
         error_message = f"No Atom or RSS feed found at URL {url} (original url: {original_url}) and auto-discovery is disabled"
         return None, url, error_message
-
     if soup:
         feed_url_element = soup.find('link', type='application/atom+xml') or soup.find('link', type='application/rss+xml')
 
@@ -138,15 +158,13 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
             error_message = f"No Atom or RSS feed found at URL {url} (original url: {original_url}). Additionally, auto-discovery failed with error: {error_message}"
             return None, url, error_message
 
-
-
     if feed_url_element:
         url = urljoin(url, feed_url_element.get('href'))
+
         if follow_feed_redirects:
             feed_response, error = fetch_content(url)
-            if feed_response and feed_response.url != url:
-                logging.info(f"Feed URL Redirected: {url} -> {feed_response.url}")
-                url = feed_response.url
+            if feed_response:
+                url = handle_redirection(feed_response, url)
             elif error:
                 logging.warning(f"Error following feed URL redirect (url: {url}): {error}")
 
@@ -158,12 +176,22 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
             error_message = f"Failed to parse content into soup for URL {url}."
             logging.error(error_message)
             return None, url, error_message
-        
-        # Added step to check for valid feed elements
+
+        # Check for valid feed elements
         if not soup.find(['rss', 'feed', 'rdf']):
-            error_message = "Content fetched but no valid Atom, RSS, or RDF feed found."
+            error_message = f"{response.status_code} Not a valid Atom, RSS, or RDF feed XML: {response.url}"
             logging.error(error_message)
-            return None, url, error_message
+            
+            # If auto_discover_feed is enabled, try searching with different suffixes
+            if auto_discover_feed:
+                logging.info(f"Attempting to auto-discover feed for URL {url} as the provided feed URL was not valid.")
+                soup, url, error_message = discover_feed(original_url, session)
+                if soup is None:
+                    error_message = f"No Atom or RSS feed found at URL {url} after attempting auto-discovery. Original error: {error_message}"
+                    logging.error(error_message)
+                    return None, url, error_message
+            else:
+                return None, url, error_message
 
         return soup, url, ""
 
@@ -420,86 +448,85 @@ def handle_discovery(url, session, switch_to_http=False, force_https=False, auto
 
     return soup, url, ""
 
+def extract_errors(text):
+    """Extract specific error messages following the 'Caused by' pattern."""
+    # Regular expression pattern to capture errors after "Caused by"
+    pattern = r"Caused by ([^\()]+)"
+    matches = re.findall(pattern, text)
+    if matches:
+        return matches[0]
+    else:
+        return text
+
+
 def get_http_response(url, session, switch_to_http=False, force_https=False):
     """Fetch the HTTP response using requests with a retry strategy."""
-
+    
     parsed_url = urlparse(url)
     original_scheme = parsed_url.scheme
 
-    # Check if we should unconditionally switch to HTTPS
-    if force_https and original_scheme == 'http':
-        parsed_url = urlparse(url)
-        url = urlunparse(parsed_url._replace(scheme='https'))
+    # Function to try fetching content and returning the response and error
+    def try_fetch(u):
+        try:
+            r = session.get(u, timeout=TIMEOUT, headers=HEADERS, verify=True)
+            r.raise_for_status()
+            return r, ""
+        except requests.RequestException as e:
+            if e.response and e.response.status_code:
+                # Extract only the primary error message for clarity
+                error_msg = f"{e.response.status_code} {e.response.reason}"
+                return None, error_msg
+            else:
+                # If there's no status code, extract detailed error messages
+                detailed_errors = extract_errors(str(e)) + ": " + str(e)
+                return None, detailed_errors
 
-    try:
-        response = session.get(url, timeout=TIMEOUT, headers=HEADERS, verify=True)
-        response.raise_for_status()
+    # Main fetching
+    response, error = try_fetch(url)
 
-        # If there were redirects, update the URL to the final URL after redirection
-        if response.history:
-            url = response.url
+    # Check if we should handle alternate schemes due to error
+    if error:
+        alt_url = None
 
-        return response, str(response.status_code)
+        if force_https and original_scheme == 'http':
+            alt_url = urlunparse(parsed_url._replace(scheme='https'))
+        
+        elif switch_to_http and original_scheme == 'https':
+            alt_url = urlunparse(parsed_url._replace(scheme='http'))
 
-    except requests.RequestException as req_err:
-        alt_scheme_url = url  # Default to the original URL
+        if alt_url:
+            logging.warning(f"Encountered error with {original_scheme.upper()}. Trying alternate URL: {alt_url}")
+            alt_response, alt_error = try_fetch(alt_url)
 
-        # Check if we should switch to HTTP on HTTPS error
-        if switch_to_http and original_scheme == 'https':
-            parsed_url = urlparse(url)
-            alt_scheme_url = urlunparse(parsed_url._replace(scheme='http'))
-            log_message = f"Encountered error with HTTPS. Error: {req_err}. Original URL: {url}. Trying URL: {alt_scheme_url}"
+            if alt_response:
+                logging.info(f"Successful request with alternate URL. Original URL: {url}. Accessed URL: {alt_url}")
+                return alt_response, ""
+            else:
+                logging.error(f"Failed request with alternate URL: {alt_url}. Error: {alt_error}")
+                return None, alt_error
 
-        # Check if we should revert to HTTPS on HTTP error
-        elif force_https and original_scheme == 'http':
-            parsed_url = urlparse(url)
-            alt_scheme_url = urlunparse(parsed_url._replace(scheme='https'))
-            log_message = f"Encountered error with HTTP. Error: {req_err}. Original URL: {url}. Trying URL: {alt_scheme_url}"
+    return response, error
 
-        else:
-            log_message = f"Encountered error with {original_scheme.upper()}. Error: {req_err}. URL: {url}"
+def handle_redirection(response, url):
+    if response.url != url:
+        logging.info(f"URL Redirected: {url} -> {response.url}")
+        return response.url
+    return url
 
-        logging.warning(log_message)
-
-        # If we changed the scheme, try fetching the content again with the new scheme
-        if alt_scheme_url != url:
-            try:
-                response = session.get(alt_scheme_url, timeout=TIMEOUT, headers=HEADERS, verify=True)
-                response.raise_for_status()
-
-                if response.history:
-                    alt_scheme_url = response.url
-
-                logging.info(f"Request successful. Original URL: {url}. Accessed URL: {alt_scheme_url}")
-                return response, str(response.status_code)
-
-            except requests.RequestException as e2:
-                logging.error(f"Error fetching URL {alt_scheme_url}. Reverting to original URL {url}. Error: {e2}")
-                status_or_error = combine_status_and_error(str(e2.response.status_code) if e2.response else "", str(e2))
-                return None, status_or_error
-
-        else:
-            logging.error(f"Failed request. Error: {req_err}. URL: {url}")
-            status_or_error = combine_status_and_error(str(req_err.response.status_code) if req_err.response else "", str(req_err))
-            return None, status_or_error
-
-    except Exception as e:
-        # Catch any other exceptions
-        logging.error(f"An unexpected error occurred. Error: {e}. URL: {url}")
-        return None, str(e)
 
 def fetch_content(url, session, switch_to_http=False, force_https=False):
     # Fetch content from the URL and handle redirections.
     response, error = get_http_response(url, session, switch_to_http, force_https)
     
     if response:
-        if response.url != url:
-            logging.info(f"URL Redirected: {url} -> {response.url}")
-            url = response.url
-        return response, f"{response.status_code}"
+        url = handle_redirection(response, url)
+        return response, f"{response.status_code}", url
+
     else:
         # If there's no response, return the error as the status_or_error
-        return None, error
+        return None, error, url
+
+import logging
 
 def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter_dates_enabled=False, log_external=False, 
                 switch_to_http=False, force_https=False, auto_discover_feed=False, follow_feed_redirects=False):
@@ -507,31 +534,35 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
     original_url = url
     if handle_blogtrottr:
         url = sanitize_url(url)
+
     bid_url = f"https://blogtrottr.com/subscription/{bid}" if bid else ""
     session = get_http_session()
+    response, error_or_status, url = fetch_content(url, session, switch_to_http, force_https)
 
-    response, error_or_status = fetch_content(url, session, switch_to_http, force_https)
-    
-    # Set a default value for soup
-    soup = None
+    # If there's an error in the HTTP response, log and return
+    if not response or not response.ok:
+        error_msg = f"HTTP error encountered at {url}. Error: {response.status_code if response else error_or_status}"
+        logging.error(error_msg)
+        return format_output("", "", original_url, "", "", "", error_or_status, url, "", bid_url, handle_blogtrottr)
 
-    # If direct fetching is successful, parse the content
-    if response and response.content:
-        soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
+    # Parse the fetched content
+    soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
 
-    # Check for valid feed tags
-    if soup is None or not soup.find(['rss', 'feed', 'rdf']):
-        if response:
-            # The fetch was successful, but no valid feed was found
-            error_message = "No valid Atom, RSS, or RDF feed found."
-            status_or_error = combine_status_and_error(f"{response.status_code}", error_message)
-        else:
-            # There was an HTTP error while fetching or couldn't fetch at all
-            status_or_error = combine_status_and_error(error_or_status, "Failed to fetch content.")
+    # Check for valid feed tags and attempt discovery if none are found
+    if not soup.find(['rss', 'feed', 'rdf']):
+        logging.info(f"Initial attempt to find feed at {url} failed. Trying further discovery.")
+        soup, url, error_message_from_fetch = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
         
-        # Return early with the error message
-        return format_output("", "", original_url, "", "", "", status_or_error, url, "", bid_url, handle_blogtrottr)
+        if not soup:
+            error_msg = f"Failed to discover feed at {url}. Error: {error_message_from_fetch}"
+            logging.error(error_msg)
+            return format_output("", "", original_url, "", "", "", error_message_from_fetch, url, "", bid_url, handle_blogtrottr)
 
+    # Log if the feed URL has changed during processing
+    if url != original_url:
+        logging.info(f"Feed URL updated: {original_url} -> {url}")
+
+    # Process and return the parsed feed data
     blogging_platform = detect_blogging_platform(soup)
     avg_posts_per_day_str, avg_posts_per_week_str, newest_post, oldest_post, num_posts_str = extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled)
     
@@ -567,6 +598,7 @@ def parse_command_line_arguments():
     parser.add_argument('--force-https', action='store_true', default=False, help='Unconditionally switch to HTTPS (but revert to HTTP on error). Default is disabled.')
     parser.add_argument('--auto-discover-feed', action='store_true', default=False, help='Automatically attempt to discover feeds by appending common feed paths. Default is disabled.')
     parser.add_argument('--follow-feed-redirects', action='store_true', default=False, help='Follow redirects for detected feed URLs')
+    parser.add_argument('--no-header', action='store_true', default=False, help='Suppress the header in the TSV output. Default is to show the header.')
 
     args = parser.parse_args()
 
@@ -634,7 +666,8 @@ def main():
     num_processes = configure_multiprocessing(args.num_processes, MAX_PROCESSES, len(urls_and_bids))
     results = execute_pooling(num_processes, urls_and_bids, args)
 
-    print(generate_header(args.blogtrottr))
+    if not args.no_header:
+        print(generate_header(args.blogtrottr))
     print_results(results)
 
 if __name__ == '__main__':
