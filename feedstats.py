@@ -526,8 +526,6 @@ def fetch_content(url, session, switch_to_http=False, force_https=False):
         # If there's no response, return the error as the status_or_error
         return None, error, url
 
-import logging
-
 def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter_dates_enabled=False, log_external=False, 
                 switch_to_http=False, force_https=False, auto_discover_feed=False, follow_feed_redirects=False):
 
@@ -537,26 +535,38 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
 
     bid_url = f"https://blogtrottr.com/subscription/{bid}" if bid else ""
     session = get_http_session()
+    
     response, error_or_status, url = fetch_content(url, session, switch_to_http, force_https)
 
-    # If there's an error in the HTTP response, log and return
+    # If there's an error in the HTTP response and auto_discovery is not enabled, log and return
     if not response or not response.ok:
         error_msg = f"HTTP error encountered at {url}. Error: {response.status_code if response else error_or_status}"
         logging.error(error_msg)
-        return format_output("", "", original_url, "", "", "", error_or_status, url, "", bid_url, handle_blogtrottr)
-
-    # Parse the fetched content
-    soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
-
-    # Check for valid feed tags and attempt discovery if none are found
-    if not soup.find(['rss', 'feed', 'rdf']):
-        logging.info(f"Initial attempt to find feed at {url} failed. Trying further discovery.")
-        soup, url, error_message_from_fetch = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
+        
+        if not auto_discover_feed:
+            return format_output("", "", original_url, "", "", "", error_or_status, url, "", bid_url, handle_blogtrottr)
+        
+        # If auto_discovery is enabled, attempt discovery despite the HTTP error
+        logging.info("Trying auto-discovery despite HTTP error due to auto-discover-feed option being set.")
+        soup, url, error_message_from_fetch = fetch_feed_url(None, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
         
         if not soup:
-            error_msg = f"Failed to discover feed for {original_url}"
+            error_msg = f"Failed to discover feed for {original_url} after HTTP error."
             logging.error(error_msg)
             return format_output("", "", original_url, "", "", "", error_message_from_fetch, url, "", bid_url, handle_blogtrottr)
+    else:
+        # Parse the fetched content
+        soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
+
+        # Check for valid feed tags and attempt discovery if none are found
+        if not soup.find(['rss', 'feed', 'rdf']):
+            logging.info(f"Initial attempt to find feed at {url} failed. Trying further discovery.")
+            soup, url, error_message_from_fetch = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
+            
+            if not soup:
+                error_msg = f"Failed to discover feed for {original_url}"
+                logging.error(error_msg)
+                return format_output("", "", original_url, "", "", "", error_message_from_fetch, url, "", bid_url, handle_blogtrottr)
 
     # Log if the feed URL has changed during processing
     if url != original_url:
@@ -566,7 +576,7 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
     blogging_platform = detect_blogging_platform(soup)
     avg_posts_per_day_str, avg_posts_per_week_str, newest_post, oldest_post, num_posts_str = extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled)
     
-    return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, str(response.status_code), url, blogging_platform, bid_url, handle_blogtrottr)
+    return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, str(response.status_code if response else error_or_status), url, blogging_platform, bid_url, handle_blogtrottr)
 
 def extract_urls_from_outline(outline_element, handle_blogtrottr):
     urls_and_bids = []
