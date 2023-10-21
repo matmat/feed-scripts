@@ -15,12 +15,12 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import urllib3
 
+# Setting up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
 
 # Disable SSL verification warnings
 #urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Setting up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
 
 FEED_SUFFIXES = [
     "feed/", "feed.xml", "index.xml", "default", "rss.xml", "atom.xml", "rss/", "feed",
@@ -31,7 +31,6 @@ FEED_SUFFIXES = [
     "articles.atom", "blog/?feed=rss2", "blog", "all.rss", "wordpress/?feed=rss2",
     "feed.php", "all"
 ]
-
 
 TZINFOS = {
     "UT": pytz.UTC,                             # Coordinated Universal Time
@@ -49,7 +48,6 @@ TZINFOS = {
     "AEDT": pytz.timezone("Australia/Sydney")   # Australian Eastern Daylight Time
 }
 
-
 USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
 TIMEOUT = 10
 BASE_URL = 'http://sanitizer.blogtrottr.com/sanitize?url='
@@ -62,6 +60,7 @@ RETRY_STRATEGY = Retry(
     backoff_factor=1
 )
 
+# EXCEPTIONS
 class HTTPError(Exception):
     """Exception raised for errors in the HTTP response."""
     pass
@@ -78,6 +77,8 @@ class ProcessUrlError(Exception):
     """Exception raised for errors while processing URLs."""
     pass
 
+
+# UTILITY FUNCTIONS
 def get_http_session():
     """Return a requests Session with a retry strategy."""
     session = requests.Session()
@@ -177,8 +178,10 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
 
     feed_url_element = None
 
+
     if soup is None and not auto_discover_feed:
-        return None, url, "Soup is None and auto-discover_feed is disabled"
+        error_message = f"No Atom or RSS feed found at URL {url} (original url: {original_url}) and auto-discovery is disabled"
+        return None, url, error_message
 
     if soup:
         feed_url_element = soup.find('link', type='application/atom+xml') or soup.find('link', type='application/rss+xml')
@@ -191,7 +194,10 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
     if not feed_url_element and auto_discover_feed:
         soup, url, error_message = discover_feed(original_url, session)
         if soup is None:
+            error_message = f"No Atom or RSS feed found at URL {url} (original url: {original_url}). Additionally, auto-discovery failed with error: {error_message}"
             return None, url, error_message
+
+
 
     if feed_url_element:
         url = urljoin(url, feed_url_element.get('href'))
@@ -269,7 +275,6 @@ def get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_e
 
     return filtered_dates, num_posts
 
-
 def custom_date_parser(date_str, heuristic_date_parsing, url):
 
     # Heuristic Parsing Logic
@@ -314,7 +319,6 @@ def custom_date_parser(date_str, heuristic_date_parsing, url):
     except:
         logging.error(f"Invalid date encountered for URL: {url}. Date string: {date_str}")
         return None
-
 
 def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
     """Extract dates from the soup object and count the number of posts."""
@@ -409,7 +413,6 @@ def determine_parser(content):
     else:
         return 'html.parser'
 
-
 def format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr):
     base_output = f'{avg_posts_per_day_str}\t{avg_posts_per_week_str}\t{original_url}\t{newest_post}\t{oldest_post}\t{num_posts_str}\t{status_or_error}\t{url}\t{blogging_platform}'
     if handle_blogtrottr:
@@ -443,7 +446,6 @@ def detect_blogging_platform(soup):
     #return tag_text if tag_text else str(generator_tag).replace('\n', ' ')
     return str(generator_tag).replace('\n', ' ')
 
-
 def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter_dates_enabled=False, log_external=False, switch_to_http=False, force_https=False, auto_discover_feed=False, follow_feed_redirects=False):
 
     if not log_external:
@@ -454,7 +456,6 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
         url = sanitize_url(url)
     bid_url = f"https://blogtrottr.com/subscription/{bid}" if bid else ""
 
-    # Default values
     blogging_platform = ''
     avg_posts_per_day_str = ''
     avg_posts_per_week_str = ''
@@ -488,6 +489,12 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
     if not soup:
         status_or_error = error_message_from_feed or error
         return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
+
+    soup, url, error_message_from_feed = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
+    if soup is None:
+        status_or_error = error_message_from_feed
+        return format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, newest_post, oldest_post, num_posts_str, status_or_error, url, blogging_platform, bid_url, handle_blogtrottr)
+
 
     # Fetching post dates and other statistics from the soup
     dates, num_posts_str = get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_enabled)
@@ -560,55 +567,62 @@ def parse_command_line_arguments():
 
     return args
 
-
-def main():
-    args = parse_command_line_arguments()
-    
-    # Global logging adjustments, if any, can remain here
-    # For example, if you have any other global logging configurations, they can stay here.
-    
-    urls_and_bids = []
-    try:
-        input_data = sys.stdin.read()
-        try:
-            root = ET.fromstring(input_data)
-            if root.tag.lower() == 'opml':
-                main_outline = root.find('./body/outline')
-                if main_outline is not None:
-                    urls_and_bids.extend(extract_urls_from_outline(main_outline, args.blogtrottr))
-        except ET.ParseError:
-            # Assuming plain URLs, validate if they have the http or https scheme
-            urls_and_bids = [(line.strip(), None) for line in input_data.splitlines() if is_valid_url(line.strip())]
-    except EOFError:
-        logging.error("Encountered EOFError when reading input data.")
-
-    # Determine the number of processes
-    num_processes = min(args.num_processes, MAX_PROCESSES, len(urls_and_bids))
-
-    # Log if fewer processes are used than requested
-    if num_processes < args.num_processes:
-        logging.info(f"Using {num_processes} processes instead of the requested {args.num_processes} due to the number of input lines.")
-
-    # Create the pool
-    pool = multiprocessing.Pool(processes=num_processes)
-
-    # Map the processes to the function, passing the log_external argument as well
-    results = pool.starmap(process_url, [(url, args.heuristic_date_parsing, args.blogtrottr, bid, args.filter_dates, args.log_external, args.switch_to_http, args.force_https, args.auto_discover_feed, args.follow_feed_redirects) for url, bid in urls_and_bids])
-
-
-
-    pool.close()  # Close the pool
-    pool.join()   # Join the processes in the pool
-
-    # Output results
-    header = 'Average posts per day\tAverage posts per week\tFeed URL\tNewest post date\tOldest post date\tNumber of posts\tHTTP response code\tProcessed URL\tBlogging Platform'
-    if args.blogtrottr:
-        header += '\tBlogtrottr URL'
-    print(header)
-
+def print_results(results):
     for result in results:
         if result:
             print(result)
+
+def generate_header(blogtrottr=False):
+    base_header = ['Average posts per day', 'Average posts per week', 'Feed URL', 
+                   'Newest post date', 'Oldest post date', 'Number of posts', 
+                   'HTTP response code', 'Processed URL', 'Blogging Platform']
+    if blogtrottr:
+        base_header.append('Blogtrottr URL')
+    return '\t'.join(base_header)
+
+def execute_pooling(num_processes, urls_and_bids, args):
+    pool = multiprocessing.Pool(processes=num_processes)
+    results = pool.starmap(process_url, [
+        (url, args.heuristic_date_parsing, args.blogtrottr, bid, args.filter_dates, 
+         args.log_external, args.switch_to_http, args.force_https, 
+         args.auto_discover_feed, args.follow_feed_redirects) 
+        for url, bid in urls_and_bids
+    ])
+    pool.close()
+    pool.join()
+    return results
+
+def configure_multiprocessing(num_processes, max_allowed, data_length):
+    final_processes = min(num_processes, max_allowed, data_length)
+    if final_processes < num_processes:
+        logging.info(f"Using {final_processes} processes instead of the requested {num_processes} due to the number of input lines.")
+    return final_processes
+
+def parse_input_data():
+    try:
+        input_data = sys.stdin.read()
+        root = ET.fromstring(input_data)
+        if root.tag.lower() == 'opml':
+            main_outline = root.find('./body/outline')
+            if main_outline is not None:
+                return extract_urls_from_outline(main_outline, args.blogtrottr)
+        return []  # Not OPML? Return an empty list and let the ParseError handle it.
+    except ET.ParseError:
+        # Parsing as plain URLs
+        return [(line.strip(), None) for line in input_data.splitlines() if is_valid_url(line.strip())]
+    except EOFError:
+        logging.error("Encountered EOFError when reading input data.")
+        return []
+
+def main():
+    args = parse_command_line_arguments()
+
+    urls_and_bids = parse_input_data()
+    num_processes = configure_multiprocessing(args.num_processes, MAX_PROCESSES, len(urls_and_bids))
+    results = execute_pooling(num_processes, urls_and_bids, args)
+
+    print(generate_header(args.blogtrottr))
+    print_results(results)
 
 if __name__ == '__main__':
     main()
