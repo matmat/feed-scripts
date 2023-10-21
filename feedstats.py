@@ -132,7 +132,7 @@ def discover_feed(base_url, session, switch_to_http=False, force_https=False):
 
     error_message = f"No Atom or RSS feed found at URL (auto-detection attempted!) {base_url}"
     logging.error(error_message)
-    return None, "", error_message
+    return None, try_url, error_message
 
 def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force_https=False, auto_discover_feed=True, follow_feed_redirects=False):
 
@@ -554,7 +554,7 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
         soup, url, error_message_from_fetch = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
         
         if not soup:
-            error_msg = f"Failed to discover feed at {url}. Error: {error_message_from_fetch}"
+            error_msg = f"Failed to discover feed for {original_url}"
             logging.error(error_msg)
             return format_output("", "", original_url, "", "", "", error_message_from_fetch, url, "", bid_url, handle_blogtrottr)
 
