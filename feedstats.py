@@ -255,6 +255,12 @@ def custom_date_parser(date_str, heuristic_date_parsing, url):
 
     # Heuristic Parsing Logic
     if heuristic_date_parsing:
+        
+        # Remove leading > symbol
+        if date_str.startswith('>'):
+            date_str = date_str[1:].strip()  # remove the leading > symbol and strip spaces if any
+            logging.info(f"Detected and removed '>' symbol. New date string: {date_str}")
+
         # Handle day anomalies
         day_replacements = {
             "Tues": "Tue",
@@ -324,7 +330,7 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
     """Extract dates from the soup object and count the number of posts."""
     dates = []
 
-    # RSS Feed Handling
+    # RSS Feed Handling 
     if soup.find('rss'):
         posts = soup.find_all('item')
         logging.info(f"Found {len(posts)} RSS items for URL {url}")  # Logging number of RSS posts
@@ -334,23 +340,38 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
         # Check for dates within each post
         for post in posts:
             date_found_in_post = False
-            
-            # Search for <pubDate>, <updated>, and <date> tags within each post
-            for tag_name in ['pubdate', 'updated', 'date']:
-                date_element = post.find(lambda tag: tag.name and tag.name.lower() == tag_name)
-                
-                if date_element and date_element.text:
-                    date_found_in_post = True
-                    try:
-                        parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
-                        if parsed_date:
-                            dates.append(parsed_date)
-                        else:
-                            logging.error(f"Unable to parse RSS {tag_name} date for URL {url}: {date_element.text}")
+        
+            # First, we determine if both <pubDate> and <updated> exist in the post.
+            pubdate_element = post.find(lambda tag: tag.name and tag.name.lower() == 'pubdate')
+            updated_element = post.find(lambda tag: tag.name and tag.name.lower() == 'updated')
 
-                    except ValueError as e:
-                        logging.error(f"Invalid date in RSS {tag_name} for URL {url}: {date_element.text} - Error: {e}")
+            # If <updated> exists, we prioritize it. If both <pubdate> and <updated> are present, we log that we're choosing <updated>.
+            if updated_element and updated_element.text:
+                date_element = updated_element
+                if pubdate_element:
+                    logging.info(f"Both <pubdate> ({pubdate_element.text}) and <updated> tags found for an RSS post in URL {url}. Using <updated> date: {updated_element.text}.")
+            # If only <pubdate> exists, we use it.
+            elif pubdate_element and pubdate_element.text:
+                #logging.info(f"Found <pubdate> in RSS for URL {url}: \"{pubdate_element.text}\"")  # Logging number of dates found
+                date_element = pubdate_element
+            # Finally, we check for a generic <date> tag as a last resort.
+            else:
+                date_element = post.find(lambda tag: tag.name and tag.name.lower() == 'date')
 
+            # If a date element (whichever it is) has been found, parse it.
+            if date_element and date_element.text:
+                date_found_in_post = True
+                try:
+                    parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                    if parsed_date:
+                        dates.append(parsed_date)
+                    else:
+                        logging.error(f"Unable to parse RSS {date_element.name} date for URL {url}: {date_element.text}")
+
+                except ValueError as e:
+                    logging.error(f"Invalid date in RSS {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
+
+            # Track whether a date was found in this post.
             if date_found_in_post:
                 all_posts_missing_dates = False
 
@@ -377,23 +398,40 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
     # Atom Handling
     elif soup.find('feed'):
         posts = soup.find_all(['entry', 'item'])
-        atom_dates = [post.find('published').text for post in posts if post.find('published') and post.find('published').text]
+        logging.info(f"Found {len(posts)} Atom items for URL {url}")  # Log the number of Atom posts found
 
-        for date_text in atom_dates:
-            try:
-                parsed_date = custom_date_parser(date_text, heuristic_date_parsing, url)
-                if parsed_date:
-                    dates.append(parsed_date)
-                else:
-                    logging.error(f"Unable to parse Atom post date for URL {url}: {date_text}")
+        for post in posts:
+            date_element = None
 
-            except ValueError as e:
-                logging.error(f"Invalid date in Atom post for URL {url}: {date_text} - Error: {e}")
+            # First, we determine if both <published> and <updated> exist in the post.
+            published_element = post.find(lambda tag: tag.name and tag.name.lower() == 'published')
+            updated_element = post.find(lambda tag: tag.name and tag.name.lower() == 'updated')
 
-        if not atom_dates:
-            updated_dates = [parse(post.updated.text, tzinfos=TZINFOS) for post in posts if post.updated and post.updated.text and not any([post.find('pubDate'), post.find('published')])]
-            if updated_dates:
-                dates.extend(updated_dates)
+            # If <updated> exists, we prioritize it. If both <published> and <updated> are present, we log that we're choosing <updated>.
+            if updated_element and updated_element.text:
+                date_element = updated_element
+                if published_element and published_element.text:  # Ensure that published_element is indeed assigned before accessing its text property
+                    logging.info(f"Both <published> ({published_element.text}) and <updated> tags found for an Atom post in URL {url}. Using <updated> date: {updated_element.text}.")
+            # If only <published> exists, we use it.
+            elif published_element and published_element.text:
+                date_element = published_element
+
+            # If a date element (whichever it is) has been found, parse it.
+            if date_element and date_element.text:
+                try:
+                    parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                    if parsed_date:
+                        dates.append(parsed_date)
+                    else:
+                        logging.error(f"Unable to parse Atom {date_element.name} date for URL {url}: {date_element.text}")
+                except ValueError as e:
+                    logging.error(f"Invalid date in Atom {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
+            # Handle scenario where neither <published> nor <updated> dates are found for a post
+            elif not published_element and not updated_element:
+                logging.error(f"Neither <published> nor <updated> date found for an Atom post in URL {url}")
+
+        # Log the number of dates found in Atom items
+        logging.info(f"Found {len(dates)} dates in Atom items for URL {url}")
     
     # RDF Handling
     elif soup.find(lambda tag: tag.name and tag.name.lower() in ['rdf', 'rdf:rdf']):
