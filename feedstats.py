@@ -308,21 +308,71 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
 
     dates = []
 
+def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
+    """Extract dates from the soup object and count the number of posts."""
+    dates = []
+
+def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
+    """Extract dates from the soup object and count the number of posts."""
+    dates = []
+
+def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
+    """Extract dates from the soup object and count the number of posts."""
+    dates = []
+
+def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
+    """Extract dates from the soup object and count the number of posts."""
+    dates = []
+
     # RSS Feed Handling
     if soup.find('rss'):
         posts = soup.find_all('item')
-        for post in posts:
-            pub_date_element = post.find(lambda tag: tag.name and tag.name.lower() == 'pubdate')
-            if pub_date_element and pub_date_element.text:
-                try:
-                    parsed_date = custom_date_parser(pub_date_element.text, heuristic_date_parsing, url)
-                    if parsed_date:
-                        dates.append(parsed_date)
-                    else:
-                        logging.error(f"Unable to parse RSS post date for URL {url}: {pub_date_element.text}")
+        logging.info(f"Found {len(posts)} RSS items for URL {url}")  # Logging number of RSS posts
+        
+        all_posts_missing_dates = True  # Track if all posts are missing dates
 
-                except ValueError as e:
-                    logging.error(f"Invalid date in RSS post for URL {url}: {pub_date_element.text} - Error: {e}")
+        # Check for dates within each post
+        for post in posts:
+            date_found_in_post = False
+            
+            # Search for <pubDate>, <updated>, and <date> tags within each post
+            for tag_name in ['pubdate', 'updated', 'date']:
+                date_element = post.find(lambda tag: tag.name and tag.name.lower() == tag_name)
+                
+                if date_element and date_element.text:
+                    date_found_in_post = True
+                    try:
+                        parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                        if parsed_date:
+                            dates.append(parsed_date)
+                        else:
+                            logging.error(f"Unable to parse RSS {tag_name} date for URL {url}: {date_element.text}")
+
+                    except ValueError as e:
+                        logging.error(f"Invalid date in RSS {tag_name} for URL {url}: {date_element.text} - Error: {e}")
+
+            if date_found_in_post:
+                all_posts_missing_dates = False
+
+        logging.info(f"Found {len(dates)} dates in RSS items for URL {url}")  # Logging number of dates found
+
+        if all_posts_missing_dates:
+            # Check for date at the channel level if all posts are missing dates
+            channel = soup.find('channel')
+            for tag_name in ['pubdate', 'updated', 'date']:
+                date_element = channel.find(lambda tag: tag.name and tag.name.lower() == tag_name)
+                
+                if date_element and date_element.text:
+                    try:
+                        parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                        if parsed_date:
+                            dates.extend([parsed_date] * len(posts))
+                            logging.info(f"Using top-level RSS {tag_name} date ({parsed_date}) for all items in URL {url}")  # Log the top-level date usage
+                        else:
+                            logging.error(f"Unable to parse RSS channel {tag_name} date for URL {url}: {date_element.text}")
+                    except ValueError as e:
+                        logging.error(f"Invalid date in RSS channel {tag_name} for URL {url}: {date_element.text} - Error: {e}")
+                    break  # Stop checking other date tags once we've found one
 
     # Atom Handling
     elif soup.find('feed'):
@@ -367,8 +417,13 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
             else:
                 logging.debug(f"No date found for an RDF post in URL {url}")
 
+        logging.info(f"Found {len(dates)} dates in RDF items for URL {url}")  # Logging number of dates found in RDF
+
     # Ensure all dates have a timezone
     dates = [date.replace(tzinfo=pytz.UTC) if date.tzinfo is None else date for date in dates]
+
+    if len(dates) != len(posts):
+        logging.warning(f"Number of dates ({len(dates)}) doesn't match the number of posts ({len(posts)}) for URL {url}")
 
     return dates, len(posts)
 
@@ -408,32 +463,31 @@ def format_output(avg_posts_per_day_str, avg_posts_per_week_str, original_url, n
         base_output += f'\t{bid_url}'
     return base_output
 
+import re
+
 def detect_blogging_platform(soup):
     """Detect the blogging platform from the soup."""
     generator_tag = soup.find('generator')
-    
     if not generator_tag:
         return ""  # return empty string if platform can't be determined
-    
+
     tag_text = generator_tag.text.strip().replace('\n', ' ')  # Replacing newlines with spaces
 
-    # List of patterns for known platforms and their corresponding names
     known_platform_patterns = [
         (re.compile(r'substack', re.I), "Substack"),
-        (re.compile(r'Medium', re.I),   "Medium"),
-        #(re.compile(r'wordpress\.org', re.I), "WordPress")
-        # Add more platforms as needed in the format
-        # (compiled_regex, "ReturnText"),
+        (re.compile(r'Medium', re.I), "Medium"),
+        #(re.compile(r'wordpress\.org', re.I), "WordPress"),
+        # Add more platforms as needed in the format (compiled_regex, "ReturnText"),
     ]
-    
+
     for pattern, platform_name in known_platform_patterns:
         if pattern.search(tag_text):
             return platform_name
 
-    # If text doesn't match any known pattern
-    # Return the text if it exists, else return the entire tag
-    #return tag_text if tag_text else str(generator_tag).replace('\n', ' ')
-    return str(generator_tag).replace('\n', ' ')
+    if generator_tag.attrs:
+        return str(generator_tag).replace('\n', ' ')  # return the entire tag if it contains attributes
+
+    return tag_text
 
 def extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled):
     dates, num_posts_str = get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_enabled)
