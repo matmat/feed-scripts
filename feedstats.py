@@ -137,27 +137,42 @@ def sanitize_url(url):
 def discover_feed(base_url, session, switch_to_http=False, force_https=False):
     logging.info(f"Starting feed discovery for base URL: {base_url}")
 
-    for suffix in FEED_SUFFIXES:
-        try_url = urljoin(base_url, suffix)
-        
-        logging.info(f"Trying feed URL: {try_url}")
-        
-        response, error = get_http_response(try_url, session, switch_to_http, force_https)
-
-        if response and response.content:
-            temp_soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
-            if temp_soup.find(lambda tag: tag.name and tag.name.lower() in ['rss', 'feed', 'rdf']):
-                logging.info(f"Valid feed discovered at {try_url}")
-                return temp_soup, try_url, ""
+    # Separate logic to attempt to find a valid feed URL
+    def try_find_feed(url):
+        for suffix in FEED_SUFFIXES:
+            try_url = urljoin(url, suffix)
+            logging.info(f"Trying feed URL: {try_url}")
+            response, error = get_http_response(try_url, session, switch_to_http, force_https)
+            if response and response.content:
+                temp_soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
+                if temp_soup.find(lambda tag: tag.name and tag.name.lower() in ['rss', 'feed', 'rdf']):
+                    logging.info(f"Valid feed discovered at {try_url}")
+                    return temp_soup, try_url, ""
+                else:
+                    logging.warning(f"No valid feed structure discovered at {try_url}")
             else:
-                logging.warning(f"No valid feed structure discovered at {try_url}")
+                logging.error(f"Failed to fetch content (discover_feed()) from {try_url}. Error: {error}")
+        return None, None, None  # return tuple of None if not found
 
-        else:
-            logging.error(f"Failed to fetch content (discover_feed()) from {try_url}. Error: {error}")
+    # Check if base_url has a path beyond just '/'
+    parsed_url = urlparse(base_url)
+    path = parsed_url.path.rstrip('/')
+    
+    # First try with original base_url
+    soup, valid_url, message = try_find_feed(base_url)
+    
+    # If not found and path is neither empty nor just '/', modify the base_url and try again
+    if not valid_url and path and path != "/":
+        modified_base_url = base_url[:-1] if base_url.endswith('/') else base_url + '/'
+        soup, valid_url, message = try_find_feed(modified_base_url)
 
-    error_message = f"No Atom or RSS feed found at URL (auto-detection attempted!) {base_url}"
-    logging.error(error_message)
-    return None, try_url, error_message
+    # If still not found after modifying the base_url (if applicable), log error and return
+    if not valid_url:
+        error_message = f"No Atom or RSS feed found at URL (auto-detection attempted!) {base_url}"
+        logging.error(error_message)
+        return None, base_url, error_message
+
+    return soup, valid_url, message
 
 def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force_https=False, auto_discover_feed=True, follow_feed_redirects=False):
 
