@@ -1,12 +1,26 @@
 import argparse
-import dns.resolver
 import logging
 import multiprocessing
 import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import timedelta, datetime
-from urllib.parse import unquote, urljoin, urlparse, urlunparse
+import argparse
+import logging
+import multiprocessing
+import re
+import sys
+import xml.etree.ElementTree as ET
+from datetime import timedelta, datetime
+import argparse
+import logging
+import multiprocessing
+import re
+import sys
+import xml.etree.ElementTree as ET
+from datetime import timedelta, datetime
+from urllib.parse import unquote, urljoin, urlparse, urlunparse, parse_qs
+from dateutil.tz import tzoffset
 
 import pytz
 import requests
@@ -42,8 +56,8 @@ TZINFOS = {
     "CST": pytz.timezone("US/Central"),         # Central Standard Time
     "EDT": pytz.timezone("US/Eastern"),         # Eastern Daylight Time
     "EST": pytz.timezone("US/Eastern"),         # Eastern Standard Time
-    "PDT": pytz.timezone("US/Pacific"),         # Pacific Daylight Time
-    "PST": pytz.timezone("US/Pacific"),         # Pacific Standard Time
+    "PDT": tzoffset("PDT", -7 * 3600),          # Pacific Daylight Time,  7 hours in seconds 
+    "PST": tzoffset("PST", -8 * 3600),          # Pacific Standard Time, 8 hours in seconds
     "MDT": pytz.timezone("US/Mountain"),        # Mountain Daylight Time
     "MST": pytz.timezone("US/Mountain"),        # Mountain Standard Time
     "AEST": pytz.timezone("Australia/Sydney"),  # Australian Eastern Standard Time
@@ -109,12 +123,15 @@ def get_http_session():
     return session
 
 def sanitize_url(url):
-    """Sanitize the provided URL if it starts with the BASE_URL."""
-    if url.startswith(BASE_URL):
-        return unquote(url.replace(BASE_URL, ''))
+    """Extract the actual URL from the provided blogtrottr sanitize URL."""
+    parsed_url = urlparse(url)
+    
+    # Check if the domain is "sanitizer.blogtrottr.com", regardless of the scheme
+    if parsed_url.netloc == "sanitizer.blogtrottr.com":
+        query_params = parse_qs(parsed_url.query)
+        if 'url' in query_params:
+            return unquote(query_params['url'][0])
     return url
-
-
 
 def discover_feed(base_url, session, switch_to_http=False, force_https=False):
     logging.info(f"Starting feed discovery for base URL: {base_url}")
@@ -135,7 +152,7 @@ def discover_feed(base_url, session, switch_to_http=False, force_https=False):
                 logging.warning(f"No valid feed structure discovered at {try_url}")
 
         else:
-            logging.error(f"Failed to fetch content from {try_url}. Error: {error}")
+            logging.error(f"Failed to fetch content (discover_feed()) from {try_url}. Error: {error}")
 
     error_message = f"No Atom or RSS feed found at URL (auto-detection attempted!) {base_url}"
     logging.error(error_message)
@@ -176,6 +193,12 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
                 logging.warning(f"Error following feed URL redirect (url: {url}): {error}")
 
     response, error = fetch_content(url)
+
+    response, error = fetch_content(url)
+    
+    if not response:
+        logging.error(f"Failed to fetch content (fetch_feed_url()) for URL {url}. Error: {error}")
+        return None, url, error
 
     try:
         soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
@@ -251,55 +274,113 @@ def get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_e
 
     return filtered_dates, num_posts
 
-def custom_date_parser(date_str, heuristic_date_parsing, url):
+def remove_leading_symbol(date_str, symbol, url):
+    if date_str.startswith(symbol):
+        date_str = date_str[1:].strip()
+        logging.info(f"Detected and removed '{symbol}' symbol for {url} Date string changed: \"{date_str}\"")
+    return date_str
 
+def handle_day_anomalies(date_str, url):
+    cur_date_str = date_str
+    day_replacements = {
+        "Monday":       "Mon",
+        "Tuesday":      "Tue",
+        "Tues":         "Tue",
+        "Wednesday":    "Wed",
+        "Thursday":     "Thu",
+        "Thurs":        "Thu",
+        "Thur":         "Thu",
+        "Friday":       "Fri",
+        "Fru":          "Fri",
+    }
+    for k, v in day_replacements.items():
+        if k in date_str:
+            date_str = date_str.replace(k, v)
+            logging.info(f"Detected day anomaly for {url} Date string changed: \"{cur_date_str}\" -> \"{date_str}\"")
+            return date_str
+    return date_str
+
+def handle_timezone_anomaly(date_str, url):
+    cur_date_str = date_str
+    timezone_pattern = re.compile(r' \(Pacific (Daylight|Standard) Time\)$')
+    if timezone_pattern.search(date_str):
+        date_str = timezone_pattern.sub('', date_str)
+        logging.info(f"Detected and removed invalid tz information for {url} Date string changed: \"{cur_date_str}\" -> \"{date_str}\"")
+    return date_str
+
+def handle_comma_separated_tz(date_str, url):
+    cur_date_str = date_str
+    if ", -" in date_str or ", +" in date_str:
+        date_str = date_str.replace(", -", "-").replace(", +", "+")
+        logging.info(f"Detected date with comma-separated tz offset for {url} Date string changed: \"{cur_date_str}\" -> \"{date_str}\"")
+    return date_str
+
+def handle_large_hours(date_str, url):
+    cur_date_str = date_str
+    hour_pattern = re.compile(r'(\d{1,2}T|\s)([0-9]{2,3}):([0-9]{2})')  # Adjusted pattern to capture 2 or 3 digits for hours
+    
+    match = hour_pattern.search(date_str)
+    if match:
+        hour_val = int(match.group(2))
+        if hour_val >= 24:  # Adjusting for hours 24 or greater
+            adjusted_hour = hour_val % 24
+            days_to_add = hour_val // 24  # Number of whole days in the hour value
+
+            date_str = hour_pattern.sub(f"{match.group(1)}{adjusted_hour:02}:{match.group(3)}", date_str)
+
+            if days_to_add > 0:
+                try:
+                    parsed_date = parse(date_str, tzinfos=TZINFOS)
+                    parsed_date += timedelta(days=days_to_add)  # Add the days
+                    date_str = parsed_date.isoformat()  # Convert datetime to ISO 8601 format string
+                    logging.info(f"Detected hour anomaly for {url}. Date string changed (added {days_to_add} day(s)): \"{cur_date_str}\" -> \"{date_str}\"")
+                except Exception as e:
+                    logging.warning(f"Failed to parse date after large hour adjustment for {url}: \"{date_str}\". Error: {e}")
+                    return cur_date_str  # Return the original string if parsing fails
+
+    return date_str
+
+def handle_comma_after_month(date_str, url):
+    cur_date_str = date_str
+    # Regular expression pattern to match dates in the format "Thu, May 28, 2015, 15:24 - 0700"
+    pattern = re.compile(r'(\w+, \w+ \d+), (\d+), (\d+:\d+ [+-]\d+)')
+    if pattern.search(date_str):
+        date_str = pattern.sub(r'\1 \2 \3', date_str)
+        logging.info(f"Detected and adjusted date format with comma after month for {url} Date string changed: \"{cur_date_str}\" -> \"{date_str}\"")
+    return date_str
+
+def handle_space_in_tz(date_str, url):
+    cur_date_str = date_str
+    # Regular expression pattern to match dates in the format "Thu, May 28, 2015, 15:24 - 0700"
+    pattern = re.compile(r'(\d+:\d+) ([+-]) (\d+)')
+    if pattern.search(date_str):
+        date_str = pattern.sub(r'\1\2\3', date_str)
+        logging.info(f"Detected and adjusted date format with space in timezone offset for {url} Date string changed: \"{cur_date_str}\" -> \"{date_str}\"")
+    return date_str
+
+def custom_date_parser(date_str, heuristic_date_parsing, url):
     # Heuristic Parsing Logic
     if heuristic_date_parsing:
-        
-        # Remove leading > symbol
-        if date_str.startswith('>'):
-            date_str = date_str[1:].strip()  # remove the leading > symbol and strip spaces if any
-            logging.info(f"Detected and removed '>' symbol. New date string: {date_str}")
+        date_str = remove_leading_symbol(date_str, '>', url)
+        date_str = handle_day_anomalies(date_str, url)
+        date_str = handle_comma_after_month(date_str, url)
+        date_str = handle_space_in_tz(date_str, url)  # Add this line
+        date_str = handle_timezone_anomaly(date_str, url)
+        date_str = handle_comma_separated_tz(date_str, url)
+        date_str = handle_large_hours(date_str, url)
 
-        # Handle day anomalies
-        day_replacements = {
-            "Tues": "Tue",
-            "Thurs": "Thu",
-            "Thur": "Thu",
-            "Fru": "Fri"
-        }
 
-        for k, v in day_replacements.items():
-            if k in date_str:
-                date_str = date_str.replace(k, v)
-                logging.info(f"Detected day anomaly, replaced '{k}' with '{v}'. New date string: {date_str}")
-
-        # Handle dates with comma-separated timezone offset
-        if ", -" in date_str or ", +" in date_str:
-            date_str = date_str.replace(", -", "-").replace(", +", "+")
-
-        # Handle invalid month
+        # If invalid month is detected
         if '-81-' in date_str:
-            logging.info(f"Encountered invalid month in date: {date_str}. Skipping.")
+            logging.info(f"Encountered invalid month in date for {url}, skipping")
             return None
-
-        # Handle hour 24
-        if " 24:" in date_str:
-            date_str = date_str.replace(" 24:", " 00:")
-
-            # Try parsing with fuzzy=True after adjusting hour 24
-            try:
-                parsed_date = parse(date_str, tzinfos=TZINFOS, fuzzy=True)
-                return parsed_date + timedelta(days=1)  # Add a day
-            except Exception as e:
-                logging.warning(f"Failed to parse date after hour 24 transformation: {date_str}. Error: {e}")
-                return None
 
     # General Parsing Logic
     try:
-        return parse(date_str, tzinfos=TZINFOS)
-    except:
-        logging.error(f"Invalid date encountered for URL: {url}. Date string: {date_str}")
+        returned_date = parse(date_str, tzinfos=TZINFOS)
+        return returned_date
+    except Exception as e:
+        logging.error(f"Invalid date encountered for URL: {url}. Date string: \"{date_str}\". Error: {e}")
         return None
 
 def valid_name(name):
@@ -309,138 +390,114 @@ def valid_name(name):
         return 'item' in name.lower()
     return False
 
+def find_date_tag(element, *tag_names):
+    """Helper function to find date tags ignoring namespaces."""
+    for tag_name in tag_names:
+        date_element = element.find(lambda tag: tag.name and tag.name.split(":")[-1].lower() == tag_name.lower())
+        if date_element and date_element.text:
+            return date_element
+    return None
+
+
+def should_fallback_to_published(dates):
+    CONFIGURABLE_INTERVAL = timedelta(minutes=5)
+    if len(dates) == 1:
+        return False  # Only one post, always use the updated timestamp
+    return max(dates) - min(dates) <= CONFIGURABLE_INTERVAL
+
+
 def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
     """Extract dates from the soup object and count the number of posts."""
-
     dates = []
 
-def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
-    """Extract dates from the soup object and count the number of posts."""
-    dates = []
-
-def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
-    """Extract dates from the soup object and count the number of posts."""
-    dates = []
-
-def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
-    """Extract dates from the soup object and count the number of posts."""
-    dates = []
-
-def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
-    """Extract dates from the soup object and count the number of posts."""
-    dates = []
-
-    # RSS Feed Handling 
+    # RSS Feed Handling
     if soup.find('rss'):
         posts = soup.find_all('item')
-        logging.info(f"Found {len(posts)} RSS items for URL {url}")  # Logging number of RSS posts
-        
-        all_posts_missing_dates = True  # Track if all posts are missing dates
+        logging.info(f"Found {len(posts)} RSS items for URL {url}")
 
-        # Check for dates within each post
+        all_updated_dates = [find_date_tag(post, 'updated').text for post in posts if find_date_tag(post, 'updated')]
+        all_dates_identical = len(all_updated_dates) > 0 and all(x == all_updated_dates[0] for x in all_updated_dates)
+
         for post in posts:
-            date_found_in_post = False
-        
-            # First, we determine if both <pubDate> and <updated> exist in the post.
-            pubdate_element = post.find(lambda tag: tag.name and tag.name.lower() == 'pubdate')
-            updated_element = post.find(lambda tag: tag.name and tag.name.lower() == 'updated')
+            date_element = find_date_tag(post, 'updated', 'pubdate', 'date')
+            
+            if date_element and date_element.name.lower() == 'updated' and (find_date_tag(post, 'pubdate') or find_date_tag(post, 'date')):
+                logging.info(f"Both <pubdate> or <date> and <updated> tags found for an RSS post in URL {url}. Using <updated> date: {date_element.text}.")
 
-            # If <updated> exists, we prioritize it. If both <pubdate> and <updated> are present, we log that we're choosing <updated>.
-            if updated_element and updated_element.text:
-                date_element = updated_element
-                if pubdate_element:
-                    logging.info(f"Both <pubdate> ({pubdate_element.text}) and <updated> tags found for an RSS post in URL {url}. Using <updated> date: {updated_element.text}.")
-            # If only <pubdate> exists, we use it.
-            elif pubdate_element and pubdate_element.text:
-                #logging.info(f"Found <pubdate> in RSS for URL {url}: \"{pubdate_element.text}\"")  # Logging number of dates found
-                date_element = pubdate_element
-            # Finally, we check for a generic <date> tag as a last resort.
-            else:
-                date_element = post.find(lambda tag: tag.name and tag.name.lower() == 'date')
-
-            # If a date element (whichever it is) has been found, parse it.
             if date_element and date_element.text:
-                date_found_in_post = True
                 try:
                     parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
                     if parsed_date:
                         dates.append(parsed_date)
                     else:
                         logging.error(f"Unable to parse RSS {date_element.name} date for URL {url}: {date_element.text}")
-
                 except ValueError as e:
                     logging.error(f"Invalid date in RSS {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
 
-            # Track whether a date was found in this post.
-            if date_found_in_post:
-                all_posts_missing_dates = False
-
-        logging.info(f"Found {len(dates)} dates in RSS items for URL {url}")  # Logging number of dates found
-
-        if all_posts_missing_dates:
-            # Check for date at the channel level if all posts are missing dates
+        # If no dates found for individual posts, look for channel-wide date
+        if len(dates) == 0 or len(dates) != len(posts):
             channel = soup.find('channel')
-            for tag_name in ['pubdate', 'updated', 'date']:
-                date_element = channel.find(lambda tag: tag.name and tag.name.lower() == tag_name)
-                
-                if date_element and date_element.text:
+            date_tags_preference_order = ['updated', 'lastBuildDate', 'pubdate', 'date']
+            for tag_name in date_tags_preference_order:
+                date_element = find_date_tag(channel, tag_name)
+                if date_element:
                     try:
                         parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
                         if parsed_date:
                             dates.extend([parsed_date] * len(posts))
-                            logging.info(f"Using top-level RSS {tag_name} date ({parsed_date}) for all items in URL {url}")  # Log the top-level date usage
+                            logging.info(f"Using top-level RSS {tag_name} date ({parsed_date}) for all items in URL {url}")
+                            break  # If a valid date is found, break out of the loop
                         else:
                             logging.error(f"Unable to parse RSS channel {tag_name} date for URL {url}: {date_element.text}")
                     except ValueError as e:
                         logging.error(f"Invalid date in RSS channel {tag_name} for URL {url}: {date_element.text} - Error: {e}")
-                    break  # Stop checking other date tags once we've found one
 
-    # Atom Handling
+    # Atom Feed Handling
     elif soup.find('feed'):
         posts = soup.find_all(['entry', 'item'])
-        logging.info(f"Found {len(posts)} Atom items for URL {url}")  # Log the number of Atom posts found
+        logging.info(f"Found {len(posts)} Atom items for URL {url}")
+
+        all_updated_dates = [find_date_tag(post, 'updated', 'modified').text for post in posts if find_date_tag(post, 'updated', 'modified')]
+        all_dates_identical = len(all_updated_dates) > 0 and all(x == all_updated_dates[0] for x in all_updated_dates)
+
+        all_posts_missing_dates = True  # Initially assume all posts lack dates
 
         for post in posts:
-            date_element = None
+            date_element = find_date_tag(post, 'updated', 'modified', 'published', 'created')
+            
+            if date_element and date_element.name.lower() in ['updated', 'modified'] and find_date_tag(post, 'published', 'created'):
+                logging.info(f"Both <published>/<created> and <updated>/<modified> tags found for an Atom post in URL {url}. Using <updated>/<modified> date: {date_element.text}.")
 
-            # First, we determine if both <published> and <updated> exist in the post.
-            published_element = post.find(lambda tag: tag.name and tag.name.lower() == 'published')
-            updated_element = post.find(lambda tag: tag.name and tag.name.lower() == 'updated')
-
-            # If <updated> exists, we prioritize it. If both <published> and <updated> are present, we log that we're choosing <updated>.
-            if updated_element and updated_element.text:
-                date_element = updated_element
-                if published_element and published_element.text:  # Ensure that published_element is indeed assigned before accessing its text property
-                    logging.info(f"Both <published> ({published_element.text}) and <updated> tags found for an Atom post in URL {url}. Using <updated> date: {updated_element.text}.")
-            # If only <published> exists, we use it.
-            elif published_element and published_element.text:
-                date_element = published_element
-
-            # If a date element (whichever it is) has been found, parse it.
             if date_element and date_element.text:
                 try:
                     parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
                     if parsed_date:
                         dates.append(parsed_date)
+                        all_posts_missing_dates = False
                     else:
                         logging.error(f"Unable to parse Atom {date_element.name} date for URL {url}: {date_element.text}")
                 except ValueError as e:
                     logging.error(f"Invalid date in Atom {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
-            # Handle scenario where neither <published> nor <updated> dates are found for a post
-            elif not published_element and not updated_element:
-                logging.error(f"Neither <published> nor <updated> date found for an Atom post in URL {url}")
 
-        # Log the number of dates found in Atom items
-        logging.info(f"Found {len(dates)} dates in Atom items for URL {url}")
-    
-    # RDF Handling
+        # If there are no posts or if all posts are missing dates
+        if len(posts) == 0 or all_posts_missing_dates:
+            feed_date_element = find_date_tag(soup.find('feed'), 'updated')
+            if feed_date_element:
+                try:
+                    parsed_date = custom_date_parser(feed_date_element.text, heuristic_date_parsing, url)
+                    if parsed_date:
+                        dates.extend([parsed_date] * len(posts))  # Apply the same date to all posts
+                        logging.info(f"Using feed-level Atom <updated> date ({parsed_date}) for all items in URL {url}")
+                    else:
+                        logging.error(f"Unable to parse Atom feed <updated> date for URL {url}: {feed_date_element.text}")
+                except ValueError as e:
+                    logging.error(f"Invalid date in Atom feed <updated> for URL {url}: {feed_date_element.text} - Error: {e}")
+
+    # RDF Feed Handling (Unchanged)
     elif soup.find(lambda tag: tag.name and tag.name.lower() in ['rdf', 'rdf:rdf']):
-        # Directly fetch all item tags
         posts = soup.find_all('item')
         logging.info(f"Found {len(posts)} RDF items for URL {url}")
-
         for post in posts:
-            # Use a lambda function to search for the 'dc:date' tag
             date_element = post.find('dc:date')
             if date_element:
                 date_text = date_element.text
@@ -455,7 +512,7 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
             else:
                 logging.debug(f"No date found for an RDF post in URL {url}")
 
-        logging.info(f"Found {len(dates)} dates in RDF items for URL {url}")  # Logging number of dates found in RDF
+        logging.info(f"Found {len(dates)} dates in RDF items for URL {url}")
 
     # Ensure all dates have a timezone
     dates = [date.replace(tzinfo=pytz.UTC) if date.tzinfo is None else date for date in dates]
@@ -708,7 +765,7 @@ def extract_urls_from_outline(outline_element, handle_blogtrottr):
     
     # Check for nested outlines
     for child_outline in outline_element.findall('outline'):
-        urls_and_bids.extend(extract_urls_from_outline(child_outline))
+        urls_and_bids.extend(extract_urls_from_outline(child_outline, handle_blogtrottr))
     
     return urls_and_bids
 
@@ -767,12 +824,18 @@ def execute_pooling(num_processes, urls_and_bids, args):
     return results
 
 def configure_multiprocessing(num_processes, max_allowed, data_length):
+    # Begin newly added lines
+    if data_length == 0:
+        logging.error("No valid URLs found in the input data.")
+        sys.exit(1)
+    # End newly added lines
+
     final_processes = min(num_processes, max_allowed, data_length)
     if final_processes < num_processes:
         logging.info(f"Using {final_processes} processes instead of the requested {num_processes} due to the number of input lines.")
     return final_processes
 
-def parse_input_data():
+def parse_input_data(args):
     try:
         input_data = sys.stdin.read()
         root = ET.fromstring(input_data)
@@ -791,7 +854,7 @@ def parse_input_data():
 def main():
     args = parse_command_line_arguments()
 
-    urls_and_bids = parse_input_data()
+    urls_and_bids = parse_input_data(args)
     num_processes = configure_multiprocessing(args.num_processes, MAX_PROCESSES, len(urls_and_bids))
     results = execute_pooling(num_processes, urls_and_bids, args)
 
