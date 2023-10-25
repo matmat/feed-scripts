@@ -65,6 +65,7 @@ TZINFOS = {
 }
 
 USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
+#USER_AGENT = 'Googlebot'
 TIMEOUT = 30
 BASE_URL = 'http://sanitizer.blogtrottr.com/sanitize?url='
 HEADERS = {'User-Agent': USER_AGENT}
@@ -398,44 +399,62 @@ def find_date_tag(element, *tag_names):
             return date_element
     return None
 
-
-def should_fallback_to_published(dates):
-    CONFIGURABLE_INTERVAL = timedelta(minutes=5)
-    if len(dates) == 1:
-        return False  # Only one post, always use the updated timestamp
-    return max(dates) - min(dates) <= CONFIGURABLE_INTERVAL
-
-
 def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
     """Extract dates from the soup object and count the number of posts."""
     dates = []
+
+    def should_fallback_to_published(dates):
+        if len(dates) <= 1:
+            return False
+        return max(dates) - min(dates) <= timedelta(minutes=5)  # Replace with your CONFIGURABLE_INTERVAL
 
     # RSS Feed Handling
     if soup.find('rss'):
         posts = soup.find_all('item')
         logging.info(f"Found {len(posts)} RSS items for URL {url}")
 
-        all_updated_dates = [find_date_tag(post, 'updated').text for post in posts if find_date_tag(post, 'updated')]
-        all_dates_identical = len(all_updated_dates) > 0 and all(x == all_updated_dates[0] for x in all_updated_dates)
-
+        # Extract dates from the preferred tag 'updated'
+        #preferred_dates = [find_date_tag(post, 'updated').text for post in posts if find_date_tag(post, 'updated')]
+        preferred_dates = []
         for post in posts:
-            date_element = find_date_tag(post, 'updated', 'pubdate', 'date')
-            
-            if date_element and date_element.name.lower() == 'updated' and (find_date_tag(post, 'pubdate') or find_date_tag(post, 'date')):
-                logging.info(f"Both <pubdate> or <date> and <updated> tags found for an RSS post in URL {url}. Using <updated> date: {date_element.text}.")
-
-            if date_element and date_element.text:
+            date_tag = find_date_tag(post, 'updated')
+            if date_tag:
                 try:
-                    parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
-                    if parsed_date:
-                        dates.append(parsed_date)
-                    else:
-                        logging.error(f"Unable to parse RSS {date_element.name} date for URL {url}: {date_element.text}")
-                except ValueError as e:
-                    logging.error(f"Invalid date in RSS {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
+                    parsed_date = custom_date_parser(date_tag.text, heuristic_date_parsing, url)
+                    preferred_dates.append(parsed_date)
+                except Exception as e:
+                    logging.error(f"Failed to parse date '{date_tag.text}' from URL {url}. Error: {e}")
 
-        # If no dates found for individual posts, look for channel-wide date
-        if len(dates) == 0 or len(dates) != len(posts):
+        # Fallback logic
+        if len(preferred_dates) == len(posts) and should_fallback_to_published(preferred_dates):
+            logging.info(f"RSS <updated> dates are within the CONFIGURABLE_INTERVAL for URL {url}. Falling back to using <pubdate>/<date> timestamps.")
+            for post in posts:
+                date_element = find_date_tag(post, 'pubdate', 'date')
+                if date_element and date_element.text:
+                    try:
+                        parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                        if parsed_date:
+                            dates.append(parsed_date)
+                        else:
+                            logging.error(f"Unable to parse RSS {date_element.name} date for URL {url}: {date_element.text}")
+                    except ValueError as e:
+                        logging.error(f"Invalid date in RSS {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
+        else:
+            for post in posts:
+                date_element = find_date_tag(post, 'updated', 'pubdate', 'date')
+                if date_element and date_element.text:
+                    try:
+                        parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                        if parsed_date:
+                            dates.append(parsed_date)
+                        else:
+                            logging.error(f"Unable to parse RSS {date_element.name} date for URL {url}: {date_element.text}")
+                    except ValueError as e:
+                        logging.error(f"Invalid date in RSS {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
+
+        #If no dates found for individual posts, look for channel-wide date
+        #if len(dates) == 0 or len(dates) != len(posts):
+        if len(dates) == 0:
             channel = soup.find('channel')
             date_tags_preference_order = ['updated', 'lastBuildDate', 'pubdate', 'date']
             for tag_name in date_tags_preference_order:
@@ -457,30 +476,50 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
         posts = soup.find_all(['entry', 'item'])
         logging.info(f"Found {len(posts)} Atom items for URL {url}")
 
-        all_updated_dates = [find_date_tag(post, 'updated', 'modified').text for post in posts if find_date_tag(post, 'updated', 'modified')]
-        all_dates_identical = len(all_updated_dates) > 0 and all(x == all_updated_dates[0] for x in all_updated_dates)
+        # Extract dates from the preferred tags 'updated' and 'modified'
+        #preferred_dates = [find_date_tag(post, 'updated', 'modified').text for post in posts if find_date_tag(post, 'updated', 'modified')]
 
-        all_posts_missing_dates = True  # Initially assume all posts lack dates
-
+        preferred_dates = []
         for post in posts:
-            date_element = find_date_tag(post, 'updated', 'modified', 'published', 'created')
-            
-            if date_element and date_element.name.lower() in ['updated', 'modified'] and find_date_tag(post, 'published', 'created'):
-                logging.info(f"Both <published>/<created> and <updated>/<modified> tags found for an Atom post in URL {url}. Using <updated>/<modified> date: {date_element.text}.")
-
-            if date_element and date_element.text:
+            date_tag = find_date_tag(post, 'updated', 'modified')
+            if date_tag:
                 try:
-                    parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
-                    if parsed_date:
-                        dates.append(parsed_date)
-                        all_posts_missing_dates = False
-                    else:
-                        logging.error(f"Unable to parse Atom {date_element.name} date for URL {url}: {date_element.text}")
-                except ValueError as e:
-                    logging.error(f"Invalid date in Atom {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
+                    parsed_date = custom_date_parser(date_tag.text, heuristic_date_parsing, url)
+                    preferred_dates.append(parsed_date)
+                except Exception as e:
+                    logging.error(f"Failed to parse date '{date_tag.text}' from URL {url}. Error: {e}")
+
+        #print("preferred_dates: ", preferred_dates)
+
+        # Fallback logic
+        if len(preferred_dates) == len(posts) and should_fallback_to_published(preferred_dates):
+            logging.info(f"Atom <updated>/<modified> dates are within the CONFIGURABLE_INTERVAL for URL {url}. Falling back to using <published>/<created> timestamps.")
+            for post in posts:
+                date_element = find_date_tag(post, 'published', 'created')
+                if date_element and date_element.text:
+                    try:
+                        parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                        if parsed_date:
+                            dates.append(parsed_date)
+                        else:
+                            logging.error(f"Unable to parse Atom {date_element.name} date for URL {url}: {date_element.text}")
+                    except ValueError as e:
+                        logging.error(f"Invalid date in Atom {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
+        else:
+            for post in posts:
+                date_element = find_date_tag(post, 'updated', 'modified', 'published', 'created')
+                if date_element and date_element.text:
+                    try:
+                        parsed_date = custom_date_parser(date_element.text, heuristic_date_parsing, url)
+                        if parsed_date:
+                            dates.append(parsed_date)
+                        else:
+                            logging.error(f"Unable to parse Atom {date_element.name} date for URL {url}: {date_element.text}")
+                    except ValueError as e:
+                        logging.error(f"Invalid date in Atom {date_element.name} for URL {url}: {date_element.text} - Error: {e}")
 
         # If there are no posts or if all posts are missing dates
-        if len(posts) == 0 or all_posts_missing_dates:
+        if len(posts) == 0 or all(date is None for date in preferred_dates):
             feed_date_element = find_date_tag(soup.find('feed'), 'updated')
             if feed_date_element:
                 try:
@@ -509,8 +548,6 @@ def extract_dates_and_count_posts(soup, url, heuristic_date_parsing):
                         logging.error(f"Unable to parse RDF post date for URL {url}: {date_text}")
                 except ValueError as e:
                     logging.error(f"Invalid date in RDF post for URL {url}: {date_text} - Error: {e}")
-            else:
-                logging.debug(f"No date found for an RDF post in URL {url}")
 
         logging.info(f"Found {len(dates)} dates in RDF items for URL {url}")
 
@@ -736,6 +773,8 @@ def process_url(url, heuristic_date_parsing, handle_blogtrottr, bid=None, filter
 
         # Check for valid feed tags and attempt discovery if none are found
         if not soup.find(lambda tag: tag.name and tag.name.lower() in ['rss', 'feed', 'rdf']):
+        #if not find_date_tag(soup, 'rss', 'feed', 'rdf'):
+
             logging.info(f"Initial attempt to find feed at {url} failed. Trying further discovery.")
             soup, url, error_message_from_fetch = fetch_feed_url(soup, url, session, original_url, switch_to_http, force_https, auto_discover_feed, follow_feed_redirects)
             
