@@ -209,12 +209,19 @@ def fetch_feed_url(soup, url, session, original_url, switch_to_http=False, force
                 logging.warning(f"Error following feed URL redirect (url: {url}): {error}")
 
     response, error = fetch_content(url)
-
-    response, error = fetch_content(url)
     
     if not response:
-        logging.error(f"Failed to fetch content (fetch_feed_url()) for URL {url}. Error: {error}")
-        return None, url, error
+        if not auto_discover_feed:
+            logging.error(f"Failed to fetch content (fetch_feed_url()) for URL {url}. Error: {error}")
+            return None, url, error
+        else:
+            logging.error(f"Failed to fetch content (fetch_feed_url()) for URL {url}. Error: {error}, trying autodiscovery")
+            soup, url, error_message = discover_feed(url, session)
+            if soup is None:
+                logging.error(f"Auto-discovery failed for URK {url}")
+                return None, url, error_message
+            else:
+                response, error = fetch_content(url)
 
     try:
         soup = BeautifulSoup(response.content, determine_parser(response.content.decode('utf-8', 'ignore')))
@@ -638,24 +645,44 @@ def detect_blogging_platform(soup):
 
 def extract_feed_data(soup, url, heuristic_date_parsing, filter_dates_enabled):
     dates, num_posts_str = get_sorted_dates_from_soup(soup, url, heuristic_date_parsing, filter_dates_enabled)
-    oldest_post = dates[0].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
-    newest_post = dates[-1].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z' if dates else ''
-
-    date_diff = dates[-1] - dates[0] if dates else timedelta(days=0)
+    
+    # Default values
+    oldest_post = ''
+    newest_post = ''
     avg_posts_per_day_str, avg_posts_per_week_str = "", ""
-    try:
-        if date_diff.days == 0:
-            avg_posts_per_day = len(dates)
-            avg_posts_per_week = len(dates) * 7
+    
+    # Check for dates availability
+    if dates:
+        if dates[0] == dates[-1]:
+            oldest_post = ''
+            newest_post = dates[-1].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z'
+            logging.info(f"URL {url}: Oldest and newest post dates are identical. Only the newest post date will be populated.")
         else:
-            avg_posts_per_day = len(dates) / date_diff.days
-            avg_posts_per_week = avg_posts_per_day * 7
-        avg_posts_per_day_str = f'{avg_posts_per_day:.8f}'
-        avg_posts_per_week_str = f'{avg_posts_per_week:.8f}'
-    except ZeroDivisionError as e:
-        logging.error(f"Error calculating averages: {str(e)}")
-    except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
+            oldest_post = dates[0].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z'
+            newest_post = dates[-1].astimezone(pytz.UTC).isoformat(timespec='seconds') + 'Z'
+            
+        date_diff = dates[-1] - dates[0]
+
+        # Calculate averages if conditions are met
+        if len(dates) >= 2 and dates[0] != dates[-1]:
+            try:
+                if date_diff.days == 0:
+                    avg_posts_per_day = len(dates)
+                    avg_posts_per_week = len(dates) * 7
+                else:
+                    avg_posts_per_day = len(dates) / date_diff.days
+                    avg_posts_per_week = avg_posts_per_day * 7
+                
+                avg_posts_per_day_str = f'{avg_posts_per_day:.8f}'
+                avg_posts_per_week_str = f'{avg_posts_per_week:.8f}'
+            except ZeroDivisionError as e:
+                logging.error(f"URL {url}: Error calculating averages: {str(e)}")
+            except Exception as e:
+                logging.error(f"URL {url}: Unexpected error: {str(e)}")
+        else:
+            logging.info(f"URL {url}: Conditions not met for average calculations. Averages will not be populated.")
+    else:
+        logging.info(f"URL {url}: No dates available. Date columns will be empty.")
 
     return avg_posts_per_day_str, avg_posts_per_week_str, newest_post, oldest_post, num_posts_str
 
